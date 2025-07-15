@@ -9,6 +9,7 @@ import pandas as pd
 import zarr
 from gcell.rna.gencode import Gencode
 from pyranges import PyRanges as pr
+from numcodecs import Blosc
 
 # required softwares:
 # bedtools
@@ -218,7 +219,6 @@ def create_peak_motif(peak_motif_bed, output_zarr, peak_bed):
     # Create sparse matrix
     motif_data_matrix = merged_data[motif_columns].values
     # Open zarr store and save data
-    from numcodecs import Blosc
 
     z = zarr.open(output_zarr, mode="w")
     z.create_dataset(
@@ -236,35 +236,29 @@ def create_peak_motif(peak_motif_bed, output_zarr, peak_bed):
 
 # Zhenhuan Jiang, 14th July, 2025
 # A zarr processing method for epigenetic activation
+
 def add_activated_peaks_to_zarr(
     zarr_file: str,
     peak_motif_bed: str,
     name: str = "activation",
 ):
     """
-    Write a peak-motif matrix directly into the 'added/{name}' group of a zarr dataset.
-
-    This function reads a motif-annotated BED file (get_motif.bed), pivots it to a motif matrix,
-    generates peak names, and stores the data into the specified increment group under the 'added' namespace.
-
-    The created group contains:
-    - 'data': motif matrix (peaks x motifs)
-    - 'peak_names': list of peak names in 'chr:start-end' format
-    - 'motif_names': list of motif cluster names (columns)
+    Write a peak-motif matrix into the 'added/{name}' group of a zarr dataset,
+    ensuring motif columns align exactly with the original motif list in the zarr.
 
     Args:
-        zarr_file (str): Path to the existing zarr dataset.
-        peak_motif_bed (str): Path to the added motif-annotated BED file (get_motif output).
-        name (str): Name of the increment group inside 'added/'.
-
-    Example:
-        add_activated_peaks_to_zarr(
-            zarr_file="original.zarr",
-            peak_motif_bed="get_motif.bed",
-            name="activation"
-        )
+        zarr_file: Path to the main zarr file.
+        peak_motif_bed: Path to added motif-annotated BED file.
+        name: Increment group name under 'added/'.
     """
-    # Step 1: Read motif BED file
+
+    # 1. Open the main zarr file and read the complete motif list
+    z_main = zarr.open(zarr_file, mode="r")
+    full_motif_list = list(z_main["motif_names"][:].astype(str))
+
+    print(f"Read {len(full_motif_list)} motifs from main zarr.")
+
+    # 2. Read the added motif BED file
     df = pd.read_csv(
         peak_motif_bed,
         sep="\t",
@@ -272,7 +266,7 @@ def add_activated_peaks_to_zarr(
         names=["Chromosome", "Start", "End", "Motif_cluster", "Score"],
     )
 
-    # Step 2: Pivot into a peak x motif matrix
+    # 3. Pivot the data into a peak x motif matrix (only existing motifs)
     pivot = df.pivot_table(
         index=["Chromosome", "Start", "End"],
         columns="Motif_cluster",
@@ -280,33 +274,38 @@ def add_activated_peaks_to_zarr(
         fill_value=0,
     ).reset_index()
 
-    motif_names = pivot.columns[3:].tolist()
-
-    # Step 3: Generate peak names
+    # 4. Generate peak names in 'chr:start-end' format
     peak_names = pivot.apply(
         lambda row: f"{row['Chromosome']}:{row['Start']}-{row['End']}", axis=1
     )
-    motif_data = pivot[motif_names].values
 
-    # Step 4: Write into zarr 'added/{increment_name}' group
+    # 5. Create a complete motif matrix with all motifs from the main motif list,
+    #    filling missing motifs with zeros and preserving motif order
+    motif_data_complete = np.zeros((len(pivot), len(full_motif_list)), dtype=np.float32)
+    present_motifs = pivot.columns[3:].tolist()
+    for i, motif in enumerate(full_motif_list):
+        if motif in present_motifs:
+            col_idx = present_motifs.index(motif)
+            motif_data_complete[:, i] = pivot[motif].values
+        # Missing motifs remain zeros
+
+    # 6. Write the complete motif matrix and peak names into the zarr 'added/{name}' group,
+    #    overwriting any existing group with the same name
     z = zarr.open(zarr_file, mode="a")
-
-    # If the group exists, delete it entirely (overwrite)
     if f"added/{name}" in z:
         del z[f"added/{name}"]
-
     group = z.require_group(f"added/{name}")
     group.create_dataset(
         "data",
-        data=motif_data,
-        chunks=(1000, motif_data.shape[1]),
+        data=motif_data_complete,
+        chunks=(1000, motif_data_complete.shape[1]),
         dtype=np.float32,
         compressor=Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE),
     )
     group.create_dataset("peak_names", data=np.array(peak_names, dtype=str))
-    group.create_dataset("motif_names", data=np.array(motif_names, dtype=str))
+    group.create_dataset("motif_names", data=np.array(full_motif_list, dtype=str))
 
-    print(f"Written increment '{name}' to {zarr_file}/added/{name}")
+    print(f"Written increment '{name}' to {zarr_file}/added/{name} with shape {motif_data_complete.shape}")
 
 # Zhenhuan Jiang, 14th July, 2025
 # A zarr processing method for epigenetic inhibition
@@ -520,3 +519,94 @@ def add_exp(
     z["gene_idx_info_index"] = gene_idx_info[:, 0].astype(int)
     z["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
     z["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
+
+# Zhenhuan Jiang, 15th July, 2025
+# A zarr processing method for ATAC-seq TSS annotation
+# This function annotates TSS and dummy expression for peaks in 'added/{added_name}'
+# of a Zarr dataset. It uses Gencode annotation and overlaps ATAC peaks with promoter
+# regions. Expression is filled with zeros.
+def add_activated_tss_to_zarr(
+    zarr_file: str,
+    name: str,
+    atac_file: str,
+    celltype: str,
+    assembly: str = "hg38",
+    version: int = 40,
+    extend_bp: int = 300,
+):
+    """
+    Annotate TSS and dummy expression for peaks in 'added/{name}' of a Zarr dataset.
+
+    Uses Gencode annotation and overlaps ATAC peaks with promoter regions. Expression is filled with zeros.
+
+    Args:
+        zarr_file (str): Path to the Zarr dataset.
+        name (str): Name of the 'added' group inside Zarr.
+        atac_file (str): ATAC peak file corresponding to the added group (BED or CSV).
+        celltype (str): Cell type name.
+        assembly (str): Genome assembly (e.g., 'hg38').
+        version (int): Gencode annotation version.
+        extend_bp (int): Promoter extension in base pairs.
+    """
+
+    # Initialize Gencode
+    gencode = Gencode(assembly=assembly, version=version)
+
+    # Read ATAC data
+    if atac_file.endswith(".bed"):
+        atac = pr(
+            pd.read_csv(
+                atac_file,
+                sep="\t",
+                header=None,
+                names=["Chromosome", "Start", "End", "aTPM"],
+            ).reset_index(),
+            int64=True,
+        )
+    else:
+        atac = pr(pd.read_csv(atac_file, index_col=0).reset_index(), int64=True)
+
+    # Overlap with promoter regions
+    promoter_regions = pr(gencode.gtf, int64=True).extend(extend_bp)
+    exp = atac.join(promoter_regions, how="left", apply_strand_suffix=False).as_df()
+
+    # Gene idx info for overlapping peaks
+    gene_idx_info = exp.query('index_b != -1')[['index', 'gene_name', 'Strand']].values
+
+    # Dummy expression data: all zeros (aligned with all peak indexes)
+    all_indexes = exp["index"].unique()
+    exp_p_series = pd.Series(0, index=all_indexes)
+    exp_n_series = pd.Series(0, index=all_indexes)
+
+    exp_p_arr = exp_p_series.sort_index().values.astype(np.float32)
+    exp_n_arr = exp_n_series.sort_index().values.astype(np.float32)
+    exp_data = np.stack([exp_p_arr, exp_n_arr]).T
+
+    # TSS annotation: True where overlapping, False elsewhere
+    tss_p_series = pd.Series(False, index=all_indexes)
+    tss_p_series.loc[exp[exp.Strand == "+"].set_index("index").index.unique()] = True
+
+    tss_n_series = pd.Series(False, index=all_indexes)
+    tss_n_series.loc[exp[exp.Strand == "-"].set_index("index").index.unique()] = True
+
+    tss_p_arr = tss_p_series.sort_index().values.astype(np.int8)
+    tss_n_arr = tss_n_series.sort_index().values.astype(np.int8)
+    tss = np.stack([tss_p_arr, tss_n_arr]).T
+
+    # Open Zarr and write to 'added/{name}'
+    z = zarr.open(zarr_file, mode="a")
+    group = z[f"added/{name}"]
+
+    for ds in [f"expression_positive/{celltype}", f"expression_negative/{celltype}", f"tss/{celltype}"]:
+        if ds in group:
+            del group[ds]
+
+    group.create_dataset(f"expression_positive/{celltype}", data=exp_data[:, 0], dtype=np.float32)
+    group.create_dataset(f"expression_negative/{celltype}", data=exp_data[:, 1], dtype=np.float32)
+    group.create_dataset(f"tss/{celltype}", data=tss, dtype=np.int8)
+
+    group["gene_idx_info_index"] = gene_idx_info[:, 0].astype(int)
+    group["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
+    group["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
+
+    print(f"TSS and dummy expression annotated for 'added/{name}' with celltype '{celltype}'.")

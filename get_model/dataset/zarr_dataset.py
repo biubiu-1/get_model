@@ -1333,39 +1333,65 @@ class RegionMotifDelta(RegionMotif):
         self._load_added_groups()
         self._load_deleted_groups()
 
+    def _sort_peaks_and_update(self):
+        df = pd.DataFrame({
+            "peak_names": self.peak_names,
+            "Chromosome": [x.split(":")[0] for x in self.peak_names],
+            "Start": [int(x.split(":")[1].split("-")[0]) for x in self.peak_names]
+        })
+        df["idx"] = np.arange(len(df))
+        df_sorted = df.sort_values(["Chromosome", "Start"]).reset_index(drop=True)
+        sorted_idx = df_sorted["idx"].values
+
+        # Reorder all related arrays
+        self.peak_names = self.peak_names[sorted_idx]
+        self.data = self.data[sorted_idx]
+        self.atpm = self.atpm[sorted_idx]
+        self.expression_positive = self.expression_positive[sorted_idx]
+        self.expression_negative = self.expression_negative[sorted_idx]
+        self.tss = self.tss[sorted_idx]
+
+        if hasattr(self, "gene_idx_info") and not self.gene_idx_info.empty:
+            old_to_new = np.zeros(len(sorted_idx), dtype=int)
+            old_to_new[sorted_idx] = np.arange(len(sorted_idx))
+            self.gene_idx_info["index"] = self.gene_idx_info["index"].map(lambda idx: old_to_new[idx])
+
+        self._process_peaks()
+
     def _load_added_groups(self):
-        """Merge incremental peak-motif data from the 'added' group in the Zarr file."""
         if 'added' not in self.dataset:
-            logging.info("No 'added' group found in Zarr file. Using original data only.")
+            print("No 'added' group found in Zarr file. Using original data only.")
             return
 
-        # All added peaks will be merged into the existing data
+        initial_num_peaks = len(self.peak_names)
+        print("Added group subkeys:", list(self.dataset['added'].group_keys()))
+
+        print(f"Initial number of peaks: {initial_num_peaks}")
         for group_name in self.dataset['added'].group_keys():
             group = self.dataset['added'][group_name]
+
             if 'data' not in group or 'peak_names' not in group:
-                logging.warning(f"Skipping added group {group_name}: missing 'data' or 'peak_names'.")
+                print(f"Skipping added group {group_name}: missing 'data' or 'peak_names'.")
                 continue
 
             added_data = group['data'][:]
             added_peak_names = group['peak_names'][:]
 
-            # Validate data shape compatibility
             if added_data.shape[1] != self.data.shape[1]:
-                logging.warning(f"Skipping added group {group_name}: incompatible data shape {added_data.shape} vs {self.data.shape}.")
+                print(f"Skipping added group {group_name}: incompatible data shape {added_data.shape} vs {self.data.shape}.")
                 continue
 
-            # Merge data and peak_names
             self.data = np.vstack([self.data, added_data])
             self.peak_names = np.concatenate([self.peak_names, added_peak_names])
 
-            # Handle ATAC signals and expression data for added peaks
+            # ATAC signals
             if f"atpm/{self.celltype}" in group:
                 added_atpm = group[f"atpm/{self.celltype}"][:]
                 self.atpm = np.concatenate([self.atpm, added_atpm])
             else:
-                logging.info(f"No ATAC signal for added group {group_name}. Using ones.")
                 self.atpm = np.concatenate([self.atpm, np.ones(added_data.shape[0])])
 
+            # Expression and TSS
             if f"expression_positive/{self.celltype}" in group:
                 added_expression_positive = group[f"expression_positive/{self.celltype}"][:]
                 added_expression_negative = group[f"expression_negative/{self.celltype}"][:]
@@ -1374,33 +1400,33 @@ class RegionMotifDelta(RegionMotif):
                 self.expression_negative = np.concatenate([self.expression_negative, added_expression_negative])
                 self.tss = np.concatenate([self.tss, added_tss])
             else:
-                logging.info(f"No expression data for added group {group_name}. Using zeros.")
                 self.expression_positive = np.concatenate([self.expression_positive, np.zeros(added_data.shape[0])])
                 self.expression_negative = np.concatenate([self.expression_negative, np.zeros(added_data.shape[0])])
                 self.tss = np.concatenate([self.tss, np.zeros(added_data.shape[0])])
 
-            # Update gene_idx_info for added peaks
+            # gene_idx_info
             if 'gene_idx_info_index' in group:
-                added_gene_idx_index = group['gene_idx_info_index'][:]
+                added_gene_idx_index = np.array(group['gene_idx_info_index'][:])
                 added_gene_idx_name = group['gene_idx_info_name'][:]
                 added_gene_idx_strand = group['gene_idx_info_strand'][:]
                 added_gene_idx_info = pd.DataFrame({
-                    "index": added_gene_idx_index + self.num_peaks,
+                    "index": added_gene_idx_index + initial_num_peaks,
                     "gene_name": added_gene_idx_name,
                     "strand": added_gene_idx_strand
                 })
                 self.gene_idx_info = pd.concat([self.gene_idx_info, added_gene_idx_info], ignore_index=True)
             else:
-                logging.info(f"No gene_idx_info for added group {group_name}. Skipping gene index update.")
+                print(f"No gene_idx_info for added group {group_name}. Skipping gene index update.")
 
-        # Update peaks after merging
-        self._process_peaks()
-        logging.info(f"Merged {len(self.peak_names) - self.num_peaks} new peaks from 'added' group.")
+        self._sort_peaks_and_update()
+        print(f"Total peaks after adding: {len(self.peak_names)}")
+
+
 
     def _load_deleted_groups(self):
         """Filter out peaks from the 'deleted' group in the Zarr file."""
         if 'deleted' not in self.dataset:
-            logging.info("No 'deleted' group found in Zarr file. No peaks removed.")
+            print("No 'deleted' group found in Zarr file. No peaks removed.")
             return
 
         deleted_peaks = set()
@@ -1413,7 +1439,7 @@ class RegionMotifDelta(RegionMotif):
             deleted_peaks.update(group['deleted_peak_names'][:])
 
         if not deleted_peaks:
-            logging.info("No peaks to delete from 'deleted' group.")
+            print("No peaks to delete from 'deleted' group.")
             return
 
         # Filter out deleted peaks
@@ -1443,7 +1469,7 @@ class RegionMotifDelta(RegionMotif):
 
         # Update peaks
         self._process_peaks()
-        logging.info(f"Removed {np.sum(~keep_mask)} peaks from 'deleted' group.")
+        print(f"Removed {np.sum(~keep_mask)} peaks from 'deleted' group.")
 
 
 # Zhenhuan Jiang, 14th July, 2025
@@ -1506,7 +1532,7 @@ class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
                     break
                     
             if zarr_path is None:
-                logging.warning(f"Could not find zarr file containing celltype {celltype}")
+                print(f"Could not find zarr file containing celltype {celltype}")
                 continue
                     
             cfg = RegionMotifConfig(
@@ -1516,4 +1542,5 @@ class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
                 drop_zero_atpm=self.drop_zero_atpm,
             )
             region_motifs[celltype] = RegionMotifDelta(cfg)
+            print(f"Loaded region motifs for celltype {celltype}: {region_motifs[celltype].num_peaks} peaks")
         return region_motifs

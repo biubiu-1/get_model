@@ -150,7 +150,7 @@ def load_checkpoint(checkpoint_path, model_key=None):
             checkpoint_path, map_location="cpu", check_hash=True
         )
     else:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     print("Load ckpt from %s" % checkpoint_path)
 
     if model_key is not None:
