@@ -22,6 +22,7 @@ from get_model.dataset.zarr_dataset import (
     RegionDataset,
     RegionMotifDataset,
     get_gencode_obj,
+    InferenceRegionMotifDeltaDataset,
 )
 from get_model.model.model import *
 from get_model.model.modules import *
@@ -411,6 +412,7 @@ class RegionZarrDataModule(RegionDataModule):
         if gencode_obj is None:
             gencode_obj = get_gencode_obj(self.cfg.assembly)
         logging.debug(gencode_obj)
+
         return InferenceRegionMotifDataset(
             **self.cfg.dataset,
             assembly=self.cfg.assembly,
@@ -419,7 +421,30 @@ class RegionZarrDataModule(RegionDataModule):
             gencode_obj=gencode_obj,
         )
 
+# Zhenhuan Jiang, 14th July, 2025
+class RegionZarrDeltaDataModule(RegionDataModule):
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
 
+    def build_inference_dataset(self, is_train=False, gene_list=None, gencode_obj=None):
+        if gencode_obj is None:
+            gencode_obj = get_gencode_obj(self.cfg.assembly)
+        logging.debug(gencode_obj)
+
+        return InferenceRegionMotifDeltaDataset(
+            **self.cfg.dataset,
+            assembly=self.cfg.assembly,
+            is_train=is_train,
+            gene_list=self.cfg.task.gene_list if gene_list is None else gene_list,
+            gencode_obj=gencode_obj,
+        )
+    
+    def setup(self, stage=None):
+        if stage == "predict":
+            self.mutations = None
+            self.dataset_predict = self.build_inference_dataset()
+
+# deprecated
 def run(cfg: DictConfig):
     model = RegionLitModel(cfg)
     logging.debug(OmegaConf.to_yaml(cfg))
@@ -436,3 +461,15 @@ def run_zarr(cfg: DictConfig):
     model.dm = dm
 
     return run_shared(cfg, model, dm)
+
+
+# Zhenhuan Jiang, 14th July, 2025
+def run_zarr_delta(cfg: DictConfig):
+    model = RegionLitModel(cfg)
+    logging.debug(OmegaConf.to_yaml(cfg))
+    dm = RegionZarrDeltaDataModule(cfg)
+    model.dm = dm
+
+    return run_shared(cfg, model, dm)
+
+

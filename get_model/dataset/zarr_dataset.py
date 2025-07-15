@@ -1324,3 +1324,196 @@ class InferenceRegionMotifDataset(RegionMotifDataset):
             "exp_label": target_i.toarray().astype(np.float32),
             "celltype": celltype,
         }
+
+
+# Zhenhuan Jiang, 14th July, 2025
+class RegionMotifDelta(RegionMotif):
+    def __init__(self, cfg: RegionMotifConfig):
+        super().__init__(cfg)
+        self._load_added_groups()
+        self._load_deleted_groups()
+
+    def _load_added_groups(self):
+        """Merge incremental peak-motif data from the 'added' group in the Zarr file."""
+        if 'added' not in self.dataset:
+            logging.info("No 'added' group found in Zarr file. Using original data only.")
+            return
+
+        # All added peaks will be merged into the existing data
+        for group_name in self.dataset['added'].group_keys():
+            group = self.dataset['added'][group_name]
+            if 'data' not in group or 'peak_names' not in group:
+                logging.warning(f"Skipping added group {group_name}: missing 'data' or 'peak_names'.")
+                continue
+
+            added_data = group['data'][:]
+            added_peak_names = group['peak_names'][:]
+
+            # Validate data shape compatibility
+            if added_data.shape[1] != self.data.shape[1]:
+                logging.warning(f"Skipping added group {group_name}: incompatible data shape {added_data.shape} vs {self.data.shape}.")
+                continue
+
+            # Merge data and peak_names
+            self.data = np.vstack([self.data, added_data])
+            self.peak_names = np.concatenate([self.peak_names, added_peak_names])
+
+            # Handle ATAC signals and expression data for added peaks
+            if f"atpm/{self.celltype}" in group:
+                added_atpm = group[f"atpm/{self.celltype}"][:]
+                self.atpm = np.concatenate([self.atpm, added_atpm])
+            else:
+                logging.info(f"No ATAC signal for added group {group_name}. Using ones.")
+                self.atpm = np.concatenate([self.atpm, np.ones(added_data.shape[0])])
+
+            if f"expression_positive/{self.celltype}" in group:
+                added_expression_positive = group[f"expression_positive/{self.celltype}"][:]
+                added_expression_negative = group[f"expression_negative/{self.celltype}"][:]
+                added_tss = group[f"tss/{self.celltype}"][:]
+                self.expression_positive = np.concatenate([self.expression_positive, added_expression_positive])
+                self.expression_negative = np.concatenate([self.expression_negative, added_expression_negative])
+                self.tss = np.concatenate([self.tss, added_tss])
+            else:
+                logging.info(f"No expression data for added group {group_name}. Using zeros.")
+                self.expression_positive = np.concatenate([self.expression_positive, np.zeros(added_data.shape[0])])
+                self.expression_negative = np.concatenate([self.expression_negative, np.zeros(added_data.shape[0])])
+                self.tss = np.concatenate([self.tss, np.zeros(added_data.shape[0])])
+
+            # Update gene_idx_info for added peaks
+            if 'gene_idx_info_index' in group:
+                added_gene_idx_index = group['gene_idx_info_index'][:]
+                added_gene_idx_name = group['gene_idx_info_name'][:]
+                added_gene_idx_strand = group['gene_idx_info_strand'][:]
+                added_gene_idx_info = pd.DataFrame({
+                    "index": added_gene_idx_index + self.num_peaks,
+                    "gene_name": added_gene_idx_name,
+                    "strand": added_gene_idx_strand
+                })
+                self.gene_idx_info = pd.concat([self.gene_idx_info, added_gene_idx_info], ignore_index=True)
+            else:
+                logging.info(f"No gene_idx_info for added group {group_name}. Skipping gene index update.")
+
+        # Update peaks after merging
+        self._process_peaks()
+        logging.info(f"Merged {len(self.peak_names) - self.num_peaks} new peaks from 'added' group.")
+
+    def _load_deleted_groups(self):
+        """Filter out peaks from the 'deleted' group in the Zarr file."""
+        if 'deleted' not in self.dataset:
+            logging.info("No 'deleted' group found in Zarr file. No peaks removed.")
+            return
+
+        deleted_peaks = set()
+        # Collect all deleted peaks from the 'deleted' group
+        for group_name in self.dataset['deleted'].group_keys():
+            group = self.dataset['deleted'][group_name]
+            if 'deleted_peak_names' not in group:
+                logging.warning(f"Skipping deleted group {group_name}: missing 'deleted_peak_names'.")
+                continue
+            deleted_peaks.update(group['deleted_peak_names'][:])
+
+        if not deleted_peaks:
+            logging.info("No peaks to delete from 'deleted' group.")
+            return
+
+        # Filter out deleted peaks
+        keep_mask = ~np.isin(self.peak_names, list(deleted_peaks))
+        self.data = self.data[keep_mask]
+        self.peak_names = self.peak_names[keep_mask]
+        self.atpm = self.atpm[keep_mask]
+        self.expression_positive = self.expression_positive[keep_mask]
+        self.expression_negative = self.expression_negative[keep_mask]
+        self.tss = self.tss[keep_mask]
+
+        # Update gene_idx_info
+        keep_indices = np.where(keep_mask)[0]
+        idx_to_iloc = {v: i for i, v in enumerate(self.gene_idx_info['index'])}
+        updated_gene_idx_info = []
+        for idx in keep_indices:
+            if idx in idx_to_iloc:
+                updated_gene_idx_info.append((
+                    idx,
+                    self.gene_idx_info.iloc[idx_to_iloc[idx]]['gene_name'],
+                    self.gene_idx_info.iloc[idx_to_iloc[idx]]['strand']
+                ))
+        self.gene_idx_info = pd.DataFrame(
+            updated_gene_idx_info,
+            columns=["index", "gene_name", "strand"]
+        )
+
+        # Update peaks
+        self._process_peaks()
+        logging.info(f"Removed {np.sum(~keep_mask)} peaks from 'deleted' group.")
+
+
+# Zhenhuan Jiang, 14th July, 2025
+class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
+    def __init__(
+        self,
+        assembly: str,
+        gencode_obj: dict,
+        zarr_path: str,
+        celltypes: Optional[str] = None,
+        transform: Optional[Callable] = None,
+        quantitative_atac: bool = False,
+        sampling_step: int = 50,
+        num_region_per_sample: int = 200,
+        leave_out_chromosomes: Optional[str] = None,
+        leave_out_celltypes: Optional[str] = None,
+        is_train: bool = False,
+        mask_ratio: float = 0.0,
+        drop_zero_atpm: bool = True,
+        gene_list: Optional[List[str]] = None
+    ):
+        super().__init__(
+            assembly=assembly,
+            gencode_obj=gencode_obj,
+            zarr_path=zarr_path,
+            celltypes=celltypes,
+            transform=transform,
+            quantitative_atac=quantitative_atac,
+            sampling_step=sampling_step,
+            num_region_per_sample=num_region_per_sample,
+            leave_out_chromosomes=leave_out_chromosomes,
+            leave_out_celltypes=leave_out_celltypes,
+            is_train=is_train,
+            mask_ratio=mask_ratio,
+            drop_zero_atpm=drop_zero_atpm,
+            gene_list=gene_list
+        )
+
+    def _load_region_motifs(self) -> Dict[str, RegionMotifDelta]:
+        """Override to use RegionMotifDelta for loading data with incremental and decremental peaks."""
+        region_motifs = {}
+        for celltype in self.celltypes:
+            if (
+                self.is_train
+                and len(self.leave_out_celltypes) > 0
+                and celltype in self.leave_out_celltypes
+            ):
+                continue
+            if (
+                not self.is_train
+                and len(self.leave_out_celltypes) > 0
+                and celltype not in self.leave_out_celltypes
+            ):
+                continue
+            
+            zarr_path = None
+            for path in self.zarr_path:
+                if celltype in zarr.open(path, mode='r')['atpm'].keys():
+                    zarr_path = path
+                    break
+                    
+            if zarr_path is None:
+                logging.warning(f"Could not find zarr file containing celltype {celltype}")
+                continue
+                    
+            cfg = RegionMotifConfig(
+                root=os.path.dirname(zarr_path),
+                data=os.path.basename(zarr_path),
+                celltype=celltype,
+                drop_zero_atpm=self.drop_zero_atpm,
+            )
+            region_motifs[celltype] = RegionMotifDelta(cfg)
+        return region_motifs

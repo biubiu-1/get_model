@@ -155,57 +155,6 @@ def get_motif(peak_file, motif_file, threads = 4, base_name='get_motif'):
     return base_name + '.bed'
 
 
-def get_motif_deprecated(peak_file, motif_file):
-    """
-    Get motif data from a peak file and a motif file.
-
-    This function uses the `bedtools` command-line tool to perform the following operations:
-    1. Intersect the peak file with the motif file.
-    2. Group the intersected data by peak and motif.
-    3. Sum the scores for overlapping peaks and motifs.
-    4. Sort the resulting data by chromosome, start, end, and motif.
-    5. Save the final result to a bed file.
-
-    Args:
-        peak_file (str): Path to the peak file.
-        motif_file (str): Path to the motif file.
-
-    Returns:
-        str: Path to the output bed file containing the peak motif data.
-    """
-
-    cmd = f"""
-    ASSEMBLY="hg38"
-    MEM="12G"
-    CPU="2"
-    ATAC_PEAK_FILE="{peak_file}"
-    ATAC_MOTIF_FILE="{motif_file}"
-    OUTPUT_PATH="get_motif.bed"
-
-    OUTPUT_BASE=$(basename "$OUTPUT_PATH" .bed)
-
-    awk -v OUTPUT_BASE="$OUTPUT_BASE" '{{OFS="\\t"; print $1,$2,$3 > OUTPUT_BASE"."$1".peak.bed"}}' "$ATAC_PEAK_FILE"
-    awk -v OUTPUT_BASE="$OUTPUT_BASE" '{{print > OUTPUT_BASE"."$1".motif.bed"}}' "$ATAC_MOTIF_FILE"
-
-    for CHR in $(ls "${{OUTPUT_BASE}}."*".motif.bed" | grep -v random | grep -v chrY | cut -d'.' -f2); do
-        bedtools intersect -a "${{OUTPUT_BASE}}.${{CHR}}.peak.bed" -b "${{OUTPUT_BASE}}.${{CHR}}.motif.bed" -wa -wb | cut -f1,2,3,7,8,10 > "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed"
-        sort -k1,1 -k2,2n -k3,3n -k4,4 "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed" -o "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed"
-        bedtools groupby -i "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed" -g 1-4 -c 5 -o sum > "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed.tmp"
-        mv "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed.tmp" "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed"
-        sort -k1,1V -k2,2n -k3,3n -k4,4 "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed" -o "${{OUTPUT_BASE}}.${{CHR}}.peak_motif.bed"
-    done
-
-    cat $(ls "${{OUTPUT_BASE}}."*".peak_motif.bed" | grep -v random | grep -v chrY | sort -k1,1V) > "$OUTPUT_PATH"
-
-    # Clean up temporary files
-    rm "${{OUTPUT_BASE}}."*".peak.bed" "${{OUTPUT_BASE}}."*".motif.bed" "${{OUTPUT_BASE}}."*".peak_motif.bed"
-
-    echo "Peak motif extraction completed. Results saved in $OUTPUT_PATH"
-    """
-    subprocess.run(cmd, shell=True, check=True)
-    return "get_motif.bed"
-
-
 def create_peak_motif(peak_motif_bed, output_zarr, peak_bed):
     """
     Create a peak motif zarr file from a peak motif bed file.
@@ -284,6 +233,131 @@ def create_peak_motif(peak_motif_bed, output_zarr, peak_bed):
     z.create_dataset("motif_names", data=motif_values)
 
     print(f"Peak motif data saved to {output_zarr}")
+
+# Zhenhuan Jiang, 14th July, 2025
+# A zarr processing method for epigenetic activation
+def add_activated_peaks_to_zarr(
+    zarr_file: str,
+    peak_motif_bed: str,
+    name: str = "activation",
+):
+    """
+    Write a peak-motif matrix directly into the 'added/{name}' group of a zarr dataset.
+
+    This function reads a motif-annotated BED file (get_motif.bed), pivots it to a motif matrix,
+    generates peak names, and stores the data into the specified increment group under the 'added' namespace.
+
+    The created group contains:
+    - 'data': motif matrix (peaks x motifs)
+    - 'peak_names': list of peak names in 'chr:start-end' format
+    - 'motif_names': list of motif cluster names (columns)
+
+    Args:
+        zarr_file (str): Path to the existing zarr dataset.
+        peak_motif_bed (str): Path to the added motif-annotated BED file (get_motif output).
+        name (str): Name of the increment group inside 'added/'.
+
+    Example:
+        add_activated_peaks_to_zarr(
+            zarr_file="original.zarr",
+            peak_motif_bed="get_motif.bed",
+            name="activation"
+        )
+    """
+    # Step 1: Read motif BED file
+    df = pd.read_csv(
+        peak_motif_bed,
+        sep="\t",
+        header=None,
+        names=["Chromosome", "Start", "End", "Motif_cluster", "Score"],
+    )
+
+    # Step 2: Pivot into a peak x motif matrix
+    pivot = df.pivot_table(
+        index=["Chromosome", "Start", "End"],
+        columns="Motif_cluster",
+        values="Score",
+        fill_value=0,
+    ).reset_index()
+
+    motif_names = pivot.columns[3:].tolist()
+
+    # Step 3: Generate peak names
+    peak_names = pivot.apply(
+        lambda row: f"{row['Chromosome']}:{row['Start']}-{row['End']}", axis=1
+    )
+    motif_data = pivot[motif_names].values
+
+    # Step 4: Write into zarr 'added/{increment_name}' group
+    z = zarr.open(zarr_file, mode="a")
+
+    # If the group exists, delete it entirely (overwrite)
+    if f"added/{name}" in z:
+        del z[f"added/{name}"]
+
+    group = z.require_group(f"added/{name}")
+    group.create_dataset(
+        "data",
+        data=motif_data,
+        chunks=(1000, motif_data.shape[1]),
+        dtype=np.float32,
+        compressor=Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE),
+    )
+    group.create_dataset("peak_names", data=np.array(peak_names, dtype=str))
+    group.create_dataset("motif_names", data=np.array(motif_names, dtype=str))
+
+    print(f"Written increment '{name}' to {zarr_file}/added/{name}")
+
+# Zhenhuan Jiang, 14th July, 2025
+# A zarr processing method for epigenetic inhibition
+def add_deleted_peaks_to_zarr(
+    zarr_file: str,
+    peak_bed: str,
+    name: str = "inhibition",
+):
+    """
+    Add deleted peaks from a BED file into a 'deleted/{name}' group in a zarr dataset.
+
+    This function converts BED peaks into 'chr:start-end' format strings and stores
+    them in a dataset called 'deleted_peak_names' within the specified group.
+
+    If the dataset already exists, new peaks are appended and duplicates removed.
+
+    Args:
+        zarr_file (str): Path to the zarr dataset.
+        peak_bed (str): BED file containing peaks to delete (chr, start, end).
+        name (str): Name of the deletion group inside 'deleted/'.
+
+    Example:
+        add_deleted_peaks_to_zarr(
+            zarr_file="original.zarr",
+            peak_bed="peaks_to_delete.bed",
+            name="inhibition"
+        )
+    """
+    # Read BED file (only first 3 columns)
+    df = pd.read_csv(
+        peak_bed,
+        sep="\t",
+        header=None,
+        usecols=[0, 1, 2],
+        names=["Chromosome", "Start", "End"]
+    )
+
+    # Format peaks as strings
+    peak_names = df.apply(lambda row: f"{row.Chromosome}:{row.Start}-{row.End}", axis=1).values.astype(str)
+
+    # Open zarr group for deletion
+    z = zarr.open(zarr_file, mode="a")
+
+    # If the group exists, delete it entirely (overwrite)
+    if f"deleted/{name}" in z:
+        del z[f"deleted/{name}"]
+
+    group = z.require_group(f"deleted/{name}")
+    group.create_dataset("deleted_peak_names", data=peak_names)
+
+    print(f"Written deletion '{name}' to {zarr_file}/deleted/{name}")
 
 
 def zip_zarr(zarr_file):
