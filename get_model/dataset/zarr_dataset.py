@@ -1221,6 +1221,7 @@ class InferenceRegionMotifDataset(RegionMotifDataset):
                 all_chromosomes, self.leave_out_chromosomes, self.is_train
             )
             logging.debug(region_motif.gene_idx_info.drop_duplicates(ignore_index=True))
+
             # Loop over genes and their TSS sites
             for gene, gene_df in (
                 region_motif.gene_idx_info.drop_duplicates(ignore_index=True)
@@ -1488,7 +1489,7 @@ class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
         leave_out_celltypes: Optional[str] = None,
         is_train: bool = False,
         mask_ratio: float = 0.0,
-        drop_zero_atpm: bool = True,
+        drop_zero_atpm: bool = False,  # to include all genes
         gene_list: Optional[List[str]] = None
     ):
         super().__init__(
