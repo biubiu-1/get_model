@@ -10,7 +10,7 @@ import zarr
 from gcell.rna.gencode import Gencode
 import pyranges as pr
 from numcodecs import Blosc
-from typing import Union
+from typing import Union, Optional
 
 # required softwares:
 # bedtools
@@ -530,9 +530,9 @@ def add_activated_tss_to_zarr(
     name: str,
     atac_file: str,
     celltype: str,
-    gene_anno: Union[str, pr.PyRanges, None] = None,
     assembly: str = "hg38",
     version: int = None,
+    gene_anno: Optional[Union[str, pr.PyRanges]] = None,
     extend_bp: int = 300,
 ):
     """
@@ -552,6 +552,11 @@ def add_activated_tss_to_zarr(
         version (int): Gencode annotation version. If specified, overrides gene_anno.
         extend_bp (int): Promoter extension in base pairs.
     """
+
+    if version is None and gene_anno is None:
+        raise ValueError("Must specify either `gene_anno` or `version`.")
+    if version is not None and gene_anno is not None:
+        raise ValueError("Specify only one of `gene_anno` or `version`, not both.")
 
     # Load Gencode annotation
     if version is not None:
@@ -636,7 +641,8 @@ def add_activation_to_zarr(
     name: str,
     celltype: str,
     assembly: str = "hg38",
-    version: int = 40,
+    version: int = None,
+    gene_anno: Optional[Union[str, pr.PyRanges]] = None,
     extend_bp: int = 300,
 ):
     add_activated_peaks_to_zarr(
@@ -652,5 +658,6 @@ def add_activation_to_zarr(
         celltype=celltype,
         assembly=assembly,
         version=version,
+        gene_anno=gene_anno,
         extend_bp=extend_bp
     )
