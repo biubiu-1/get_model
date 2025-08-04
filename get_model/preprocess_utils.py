@@ -236,7 +236,6 @@ def create_peak_motif(peak_motif_bed, output_zarr, peak_bed):
 
 # Zhenhuan Jiang, 14th July, 2025
 # A zarr processing method for epigenetic activation
-
 def add_activated_peaks_to_zarr(
     zarr_file: str,
     peak_motif_bed: str,
@@ -309,7 +308,7 @@ def add_activated_peaks_to_zarr(
 
 # Zhenhuan Jiang, 14th July, 2025
 # A zarr processing method for epigenetic inhibition
-def add_deleted_peaks_to_zarr(
+def add_deletion_to_zarr(
     zarr_file: str,
     peak_bed: str,
     name: str = "inhibition",
@@ -328,7 +327,7 @@ def add_deleted_peaks_to_zarr(
         name (str): Name of the deletion group inside 'deleted/'.
 
     Example:
-        add_deleted_peaks_to_zarr(
+        add_deletion_to_zarr(
             zarr_file="original.zarr",
             peak_bed="peaks_to_delete.bed",
             name="inhibition"
@@ -610,3 +609,30 @@ def add_activated_tss_to_zarr(
     group["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
 
     print(f"TSS and dummy expression annotated for 'added/{name}' with celltype '{celltype}'.")
+
+
+def add_activation_to_zarr(
+    zarr_file: str,
+    peak_motif_bed: str,
+    atac_file: str,
+    name: str,
+    celltype: str,
+    assembly: str = "hg38",
+    version: int = 40,
+    extend_bp: int = 300,
+):
+    add_activated_peaks_to_zarr(
+        zarr_file=zarr_file,
+        peak_motif_bed=peak_motif_bed,
+        name=name
+    )
+
+    add_activated_tss_to_zarr(
+        zarr_file=zarr_file,
+        name=name,
+        atac_file=atac_file,
+        celltype=celltype,
+        assembly=assembly,
+        version=version,
+        extend_bp=extend_bp
+    )
