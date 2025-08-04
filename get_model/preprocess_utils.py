@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import zarr
 from gcell.rna.gencode import Gencode
-from pyranges import PyRanges as pr
+import pyranges as pr
 from numcodecs import Blosc
 from typing import Union
 
@@ -446,7 +446,7 @@ def add_exp(
 
     # Read ATAC data
     if atac_file.endswith(".bed"):
-        atac = pr(
+        atac = pr.PyRanges(
             pd.read_csv(
                 atac_file,
                 sep="\t",
@@ -456,11 +456,11 @@ def add_exp(
             int64=True,
         )
     else:
-        atac = pr(pd.read_csv(atac_file, index_col=0).reset_index(), int64=True)
+        atac = pr.PyRanges(pd.read_csv(atac_file, index_col=0).reset_index(), int64=True)
 
     # Join ATAC and RNA data
-    exp = atac.join(pr(promoter_exp, int64=True).extend(extend_bp), how="left").as_df()
-    
+    exp = atac.join(pr.PyRanges(promoter_exp, int64=True).extend(extend_bp), how="left").as_df()
+
     # Save to exp.feather for getting gene name to index
     gene_idx_info = exp.query('index_b!=-1')[['index', 'gene_name', 'Strand']].values
 
@@ -571,11 +571,11 @@ def add_activated_tss_to_zarr(
     gtf_df["TSS"] = gtf_df.apply(lambda row: row["Start"] if row["Strand"] == "+" else row["End"], axis=1)
     gtf_df["Start"] = gtf_df["TSS"] - 1
     gtf_df["End"] = gtf_df["TSS"]
-    promoter_regions = pr(gtf_df[["Chromosome", "Start", "End", "Strand", "gene_name"]], int64=True).extend(extend_bp)
+    promoter_regions = pr.PyRanges(gtf_df[["Chromosome", "Start", "End", "Strand", "gene_name"]], int64=True).extend(extend_bp)
 
     # Load ATAC data
     if atac_file.endswith(".bed"):
-        atac = pr(
+        atac = pr.PyRanges(
             pd.read_csv(
                 atac_file,
                 sep="\t",
@@ -585,7 +585,7 @@ def add_activated_tss_to_zarr(
             int64=True,
         )
     else:
-        atac = pr(pd.read_csv(atac_file, index_col=0).reset_index(), int64=True)
+        atac = pr.PyRanges(pd.read_csv(atac_file, index_col=0).reset_index(), int64=True)
 
     # Overlap ATAC peaks with promoters
     exp = atac.join(promoter_regions, how="left", apply_strand_suffix=False).as_df()
