@@ -10,6 +10,7 @@ import zarr
 from gcell.rna.gencode import Gencode
 from pyranges import PyRanges as pr
 from numcodecs import Blosc
+from typing import Union
 
 # required softwares:
 # bedtools
@@ -519,7 +520,7 @@ def add_exp(
     z["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
     z["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
 
-# Zhenhuan Jiang, 15th July, 2025
+# Zhenhuan Jiang, 4th, Aug, 2025
 # A zarr processing method for ATAC-seq TSS annotation
 # This function annotates TSS and dummy expression for peaks in 'added/{added_name}'
 # of a Zarr dataset. It uses Gencode annotation and overlaps ATAC peaks with promoter
@@ -529,29 +530,50 @@ def add_activated_tss_to_zarr(
     name: str,
     atac_file: str,
     celltype: str,
+    gene_anno: Union[str, pr.PyRanges, None] = None,
     assembly: str = "hg38",
-    version: int = 40,
+    version: int = None,
     extend_bp: int = 300,
 ):
     """
     Annotate TSS and dummy expression for peaks in 'added/{name}' of a Zarr dataset.
-
-    Uses Gencode annotation and overlaps ATAC peaks with promoter regions. Expression is filled with zeros.
+    Supports:
+        - Gencode version/assembly (if version is provided)
+        - GTF file path
+        - PyRanges object
 
     Args:
         zarr_file (str): Path to the Zarr dataset.
         name (str): Name of the 'added' group inside Zarr.
-        atac_file (str): ATAC peak file corresponding to the added group (BED or CSV).
+        atac_file (str): ATAC peak file (BED or CSV).
         celltype (str): Cell type name.
-        assembly (str): Genome assembly (e.g., 'hg38').
-        version (int): Gencode annotation version.
+        gene_anno (str or PyRanges): Gencode GTF path or PyRanges object.
+        assembly (str): Genome assembly (default: "hg38").
+        version (int): Gencode annotation version. If specified, overrides gene_anno.
         extend_bp (int): Promoter extension in base pairs.
     """
 
-    # Initialize Gencode
-    gencode = Gencode(assembly=assembly, version=version)
+    # Load Gencode annotation
+    if version is not None:
+        gencode = Gencode(assembly=assembly, version=version)
+        gtf_df = gencode.gtf
+    elif isinstance(gene_anno, str):
+        gtf_df = pr.read_gtf(gene_anno).df
+    elif isinstance(gene_anno, pr.PyRanges):
+        gtf_df = gene_anno.df
+    else:
+        raise ValueError("Please provide either a valid `version` or `gene_anno` (GTF path or PyRanges).")
 
-    # Read ATAC data
+    # Extract transcript TSS info
+    if "Feature" in gtf_df.columns:
+        gtf_df = gtf_df[gtf_df["Feature"] == "transcript"]
+    gtf_df = gtf_df[["Chromosome", "Start", "End", "Strand", "gene_name"]].copy()
+    gtf_df["TSS"] = gtf_df.apply(lambda row: row["Start"] if row["Strand"] == "+" else row["End"], axis=1)
+    gtf_df["Start"] = gtf_df["TSS"] - 1
+    gtf_df["End"] = gtf_df["TSS"]
+    promoter_regions = pr(gtf_df[["Chromosome", "Start", "End", "Strand", "gene_name"]], int64=True).extend(extend_bp)
+
+    # Load ATAC data
     if atac_file.endswith(".bed"):
         atac = pr(
             pd.read_csv(
@@ -565,34 +587,30 @@ def add_activated_tss_to_zarr(
     else:
         atac = pr(pd.read_csv(atac_file, index_col=0).reset_index(), int64=True)
 
-    # Overlap with promoter regions
-    promoter_regions = pr(gencode.gtf, int64=True).extend(extend_bp)
+    # Overlap ATAC peaks with promoters
     exp = atac.join(promoter_regions, how="left", apply_strand_suffix=False).as_df()
 
-    # Gene idx info for overlapping peaks
-    gene_idx_info = exp.query('index_b != -1')[['index', 'gene_name', 'Strand']].values
+    # Extract gene info
+    gene_idx_info = exp.query('index_b != -1')[['index', 'gene_name', 'Strand']].drop_duplicates().values
 
-    # Dummy expression data: all zeros (aligned with all peak indexes)
+    # Dummy expression arrays
     all_indexes = exp["index"].unique()
-    exp_p_series = pd.Series(0, index=all_indexes)
-    exp_n_series = pd.Series(0, index=all_indexes)
+    all_indexes.sort()
+    exp_data = np.zeros((len(all_indexes), 2), dtype=np.float32)
 
-    exp_p_arr = exp_p_series.sort_index().values.astype(np.float32)
-    exp_n_arr = exp_n_series.sort_index().values.astype(np.float32)
-    exp_data = np.stack([exp_p_arr, exp_n_arr]).T
-
-    # TSS annotation: True where overlapping, False elsewhere
+    # TSS annotation arrays
     tss_p_series = pd.Series(False, index=all_indexes)
     tss_p_series.loc[exp[exp.Strand == "+"].set_index("index").index.unique()] = True
 
     tss_n_series = pd.Series(False, index=all_indexes)
     tss_n_series.loc[exp[exp.Strand == "-"].set_index("index").index.unique()] = True
 
-    tss_p_arr = tss_p_series.sort_index().values.astype(np.int8)
-    tss_n_arr = tss_n_series.sort_index().values.astype(np.int8)
-    tss = np.stack([tss_p_arr, tss_n_arr]).T
+    tss = np.stack([
+        tss_p_series.sort_index().astype(np.int8).values,
+        tss_n_series.sort_index().astype(np.int8).values
+    ]).T
 
-    # Open Zarr and write to 'added/{name}'
+    # Write into Zarr
     z = zarr.open(zarr_file, mode="a")
     group = z[f"added/{name}"]
 
