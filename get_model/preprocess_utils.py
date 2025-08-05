@@ -596,7 +596,8 @@ def add_activated_tss_to_zarr(
     exp = atac.join(promoter_regions, how="left", apply_strand_suffix=False).as_df()
 
     # Extract gene info
-    gene_idx_info = exp.query('index_b != -1')[['index', 'gene_name', 'Strand']].drop_duplicates().values
+    #gene_idx_info = exp.query('index_b != -1')[['index', 'gene_name', 'Strand']].drop_duplicates().values
+    gene_idx_info = exp[exp["gene_name"].notnull()][['index', 'gene_name', 'Strand']].drop_duplicates().values
 
     # Dummy expression arrays
     all_indexes = exp["index"].unique()

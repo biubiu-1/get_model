@@ -1353,9 +1353,11 @@ class RegionMotifDelta(RegionMotif):
         self.tss = self.tss[sorted_idx]
 
         if hasattr(self, "gene_idx_info") and not self.gene_idx_info.empty:
-            old_to_new = np.zeros(len(sorted_idx), dtype=int)
-            old_to_new[sorted_idx] = np.arange(len(sorted_idx))
-            self.gene_idx_info["index"] = self.gene_idx_info["index"].map(lambda idx: old_to_new[idx])
+            old_to_new = dict(zip(sorted_idx, np.arange(len(sorted_idx))))
+            self.gene_idx_info["index"] = self.gene_idx_info["index"].map(old_to_new)
+            self.gene_idx_info.dropna(subset=["index"], inplace=True)
+            self.gene_idx_info["index"] = self.gene_idx_info["index"].astype(int)
+            self.gene_idx_info = self.gene_idx_info.sort_values("index").reset_index(drop=True)
 
         self._process_peaks()
 
@@ -1420,6 +1422,7 @@ class RegionMotifDelta(RegionMotif):
                 print(f"No gene_idx_info for added group {group_name}. Skipping gene index update.")
 
         self._sort_peaks_and_update()
+
         print(f"Total peaks after adding: {len(self.peak_names)}")
 
 
@@ -1475,39 +1478,8 @@ class RegionMotifDelta(RegionMotif):
 
 # Zhenhuan Jiang, 14th July, 2025
 class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
-    def __init__(
-        self,
-        assembly: str,
-        gencode_obj: dict,
-        zarr_path: str,
-        celltypes: Optional[str] = None,
-        transform: Optional[Callable] = None,
-        quantitative_atac: bool = False,
-        sampling_step: int = 50,
-        num_region_per_sample: int = 200,
-        leave_out_chromosomes: Optional[str] = None,
-        leave_out_celltypes: Optional[str] = None,
-        is_train: bool = False,
-        mask_ratio: float = 0.0,
-        drop_zero_atpm: bool = False,  # to include all genes
-        gene_list: Optional[List[str]] = None
-    ):
-        super().__init__(
-            assembly=assembly,
-            gencode_obj=gencode_obj,
-            zarr_path=zarr_path,
-            celltypes=celltypes,
-            transform=transform,
-            quantitative_atac=quantitative_atac,
-            sampling_step=sampling_step,
-            num_region_per_sample=num_region_per_sample,
-            leave_out_chromosomes=leave_out_chromosomes,
-            leave_out_celltypes=leave_out_celltypes,
-            is_train=is_train,
-            mask_ratio=mask_ratio,
-            drop_zero_atpm=drop_zero_atpm,
-            gene_list=gene_list
-        )
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)  
 
     def _load_region_motifs(self) -> Dict[str, RegionMotifDelta]:
         """Override to use RegionMotifDelta for loading data with incremental and decremental peaks."""
@@ -1544,4 +1516,5 @@ class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
             )
             region_motifs[celltype] = RegionMotifDelta(cfg)
             print(f"Loaded region motifs for celltype {celltype}: {region_motifs[celltype].num_peaks} peaks")
+
         return region_motifs
