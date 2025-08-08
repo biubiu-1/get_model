@@ -264,129 +264,6 @@ def create_peak_motif(peak_motif_bed, output_zarr, peak_bed):
 
     print(f"Peak motif data saved to {output_zarr}")
 
-# Zhenhuan Jiang, 14th July, 2025
-# A zarr processing method for epigenetic activation
-def add_activated_peaks_to_zarr(
-    zarr_file: str,
-    peak_motif_bed: str,
-    name: str = "activation",
-):
-    """
-    Write a peak-motif matrix into the 'added/{name}' group of a zarr dataset,
-    ensuring motif columns align exactly with the original motif list in the zarr.
-
-    Args:
-        zarr_file: Path to the main zarr file.
-        peak_motif_bed: Path to added motif-annotated BED file.
-        name: Increment group name under 'added/'.
-    """
-
-    # 1. Open the main zarr file and read the complete motif list
-    z_main = zarr.open(zarr_file, mode="r")
-    full_motif_list = list(z_main["motif_names"][:].astype(str))
-
-    print(f"Read {len(full_motif_list)} motifs from main zarr.")
-
-    # 2. Read the added motif BED file
-    df = pd.read_csv(
-        peak_motif_bed,
-        sep="\t",
-        header=None,
-        names=["Chromosome", "Start", "End", "Motif_cluster", "Score"],
-    )
-
-    # 3. Pivot the data into a peak x motif matrix (only existing motifs)
-    pivot = df.pivot_table(
-        index=["Chromosome", "Start", "End"],
-        columns="Motif_cluster",
-        values="Score",
-        fill_value=0,
-    ).reset_index()
-
-    # 4. Generate peak names in 'chr:start-end' format
-    peak_names = pivot.apply(
-        lambda row: f"{row['Chromosome']}:{row['Start']}-{row['End']}", axis=1
-    )
-
-    # 5. Create a complete motif matrix with all motifs from the main motif list,
-    #    filling missing motifs with zeros and preserving motif order
-    motif_data_complete = np.zeros((len(pivot), len(full_motif_list)), dtype=np.float32)
-    present_motifs = pivot.columns[3:].tolist()
-    for i, motif in enumerate(full_motif_list):
-        if motif in present_motifs:
-            col_idx = present_motifs.index(motif)
-            motif_data_complete[:, i] = pivot[motif].values
-        # Missing motifs remain zeros
-
-    # 6. Write the complete motif matrix and peak names into the zarr 'added/{name}' group,
-    #    overwriting any existing group with the same name
-    z = zarr.open(zarr_file, mode="a")
-    if f"added/{name}" in z:
-        del z[f"added/{name}"]
-    group = z.require_group(f"added/{name}")
-    group.create_dataset(
-        "data",
-        data=motif_data_complete,
-        chunks=(1000, motif_data_complete.shape[1]),
-        dtype=np.float32,
-        compressor=Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE),
-    )
-    group.create_dataset("peak_names", data=np.array(peak_names, dtype=str))
-    group.create_dataset("motif_names", data=np.array(full_motif_list, dtype=str))
-
-    print(f"Written increment '{name}' to {zarr_file}/added/{name} with shape {motif_data_complete.shape}")
-
-# Zhenhuan Jiang, 14th July, 2025
-# A zarr processing method for epigenetic inhibition
-def add_deletion_to_zarr(
-    zarr_file: str,
-    peak_bed: str,
-    name: str = "inhibition",
-):
-    """
-    Add deleted peaks from a BED file into a 'deleted/{name}' group in a zarr dataset.
-
-    This function converts BED peaks into 'chr:start-end' format strings and stores
-    them in a dataset called 'deleted_peak_names' within the specified group.
-
-    If the dataset already exists, new peaks are appended and duplicates removed.
-
-    Args:
-        zarr_file (str): Path to the zarr dataset.
-        peak_bed (str): BED file containing peaks to delete (chr, start, end).
-        name (str): Name of the deletion group inside 'deleted/'.
-
-    Example:
-        add_deletion_to_zarr(
-            zarr_file="original.zarr",
-            peak_bed="peaks_to_delete.bed",
-            name="inhibition"
-        )
-    """
-    # Read BED file (only first 3 columns)
-    df = pd.read_csv(
-        peak_bed,
-        sep="\t",
-        header=None,
-        usecols=[0, 1, 2],
-        names=["Chromosome", "Start", "End"]
-    )
-
-    # Format peaks as strings
-    peak_names = df.apply(lambda row: f"{row.Chromosome}:{row.Start}-{row.End}", axis=1).values.astype(str)
-
-    # Open zarr group for deletion
-    z = zarr.open(zarr_file, mode="a")
-
-    # If the group exists, delete it entirely (overwrite)
-    if f"deleted/{name}" in z:
-        del z[f"deleted/{name}"]
-
-    group = z.require_group(f"deleted/{name}")
-    group.create_dataset("deleted_peak_names", data=peak_names)
-
-    print(f"Written deletion '{name}' to {zarr_file}/deleted/{name}")
-
 
 def zip_zarr(zarr_file):
     subprocess.run(["zip", "-r", f"{zarr_file}.zip", zarr_file], check=True)
@@ -549,6 +426,79 @@ def add_exp(
     z["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
     z["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
 
+
+# Zhenhuan Jiang, 14th July, 2025
+# A zarr processing method for epigenetic activation
+def add_activated_peaks_to_zarr(
+    zarr_file: str,
+    peak_motif_bed: str,
+    name: str = "activation",
+):
+    """
+    Write a peak-motif matrix into the 'added/{name}' group of a zarr dataset,
+    ensuring motif columns align exactly with the original motif list in the zarr.
+
+    Args:
+        zarr_file: Path to the main zarr file.
+        peak_motif_bed: Path to added motif-annotated BED file.
+        name: Increment group name under 'added/'.
+    """
+
+    # 1. Open the main zarr file and read the complete motif list
+    z_main = zarr.open(zarr_file, mode="r")
+    full_motif_list = list(z_main["motif_names"][:].astype(str))
+
+    print(f"Read {len(full_motif_list)} motifs from main zarr.")
+
+    # 2. Read the added motif BED file
+    df = pd.read_csv(
+        peak_motif_bed,
+        sep="\t",
+        header=None,
+        names=["Chromosome", "Start", "End", "Motif_cluster", "Score"],
+    )
+
+    # 3. Pivot the data into a peak x motif matrix (only existing motifs)
+    pivot = df.pivot_table(
+        index=["Chromosome", "Start", "End"],
+        columns="Motif_cluster",
+        values="Score",
+        fill_value=0,
+    ).reset_index()
+
+    # 4. Generate peak names in 'chr:start-end' format
+    peak_names = pivot.apply(
+        lambda row: f"{row['Chromosome']}:{row['Start']}-{row['End']}", axis=1
+    )
+
+    # 5. Create a complete motif matrix with all motifs from the main motif list,
+    #    filling missing motifs with zeros and preserving motif order
+    motif_data_complete = np.zeros((len(pivot), len(full_motif_list)), dtype=np.float32)
+    present_motifs = pivot.columns[3:].tolist()
+    for i, motif in enumerate(full_motif_list):
+        if motif in present_motifs:
+            col_idx = present_motifs.index(motif)
+            motif_data_complete[:, i] = pivot[motif].values
+        # Missing motifs remain zeros
+
+    # 6. Write the complete motif matrix and peak names into the zarr 'added/{name}' group,
+    #    overwriting any existing group with the same name
+    z = zarr.open(zarr_file, mode="a")
+    if f"added/{name}" in z:
+        del z[f"added/{name}"]
+    group = z.require_group(f"added/{name}")
+    group.create_dataset(
+        "data",
+        data=motif_data_complete,
+        chunks=(1000, motif_data_complete.shape[1]),
+        dtype=np.float32,
+        compressor=Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE),
+    )
+    group.create_dataset("peak_names", data=np.array(peak_names, dtype=str))
+    group.create_dataset("motif_names", data=np.array(full_motif_list, dtype=str))
+
+    print(f"Written increment '{name}' to {zarr_file}/added/{name} with shape {motif_data_complete.shape}")
+
 # Zhenhuan Jiang, 4th, Aug, 2025
 # A zarr processing method for ATAC-seq TSS annotation
 # This function annotates TSS and dummy expression for peaks in 'added/{added_name}'
@@ -653,15 +603,15 @@ def add_activated_tss_to_zarr(
         if ds in group:
             del group[ds]
 
-    group.create_dataset(f"expression_positive/{celltype}", data=exp_data[:, 0], dtype=np.float32)
-    group.create_dataset(f"expression_negative/{celltype}", data=exp_data[:, 1], dtype=np.float32)
-    group.create_dataset(f"tss/{celltype}", data=tss, dtype=np.int8)
+        group.create_dataset(f"expression_positive/{celltype}", data=exp_data[:, 0], dtype=np.float32)
+        group.create_dataset(f"expression_negative/{celltype}", data=exp_data[:, 1], dtype=np.float32)
+        group.create_dataset(f"tss/{celltype}", data=tss, dtype=np.int8)
 
-    group["gene_idx_info_index"] = gene_idx_info[:, 0].astype(int)
-    group["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
-    group["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
+        group["gene_idx_info_index"] = gene_idx_info[:, 0].astype(int)
+        group["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
+        group["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
 
-    print(f"TSS and dummy expression annotated for 'added/{name}' with celltype '{celltype}'.")
+        print(f"TSS and dummy expression annotated for 'added/{name}' with celltype '{celltype}'.")
 
 
 def add_activation_to_zarr(
@@ -691,3 +641,56 @@ def add_activation_to_zarr(
         gene_anno=gene_anno,
         extend_bp=extend_bp
     )
+
+# Zhenhuan Jiang, 14th July, 2025
+# A zarr processing method for epigenetic inhibition
+def add_deletion_to_zarr(
+    zarr_file: str,
+    peak_bed: str,
+    name: str = "inhibition",
+):
+    """
+    Add deleted peaks from a BED file into a 'deleted/{name}' group in a zarr dataset.
+
+    This function converts BED peaks into 'chr:start-end' format strings and stores
+    them in a dataset called 'deleted_peak_names' within the specified group.
+
+    If the dataset already exists, new peaks are appended and duplicates removed.
+
+    Args:
+        zarr_file (str): Path to the zarr dataset.
+        peak_bed (str): BED file containing peaks to delete (chr, start, end).
+        name (str): Name of the deletion group inside 'deleted/'.
+
+    Example:
+        add_deletion_to_zarr(
+            zarr_file="original.zarr",
+            peak_bed="peaks_to_delete.bed",
+            name="inhibition"
+        )
+    """
+    # Read BED file (only first 3 columns)
+    df = pd.read_csv(
+        peak_bed,
+        sep="\t",
+        header=None,
+        usecols=[0, 1, 2],
+        names=["Chromosome", "Start", "End"]
+    )
+
+    # Format peaks as strings
+    peak_names = df.apply(lambda row: f"{row.Chromosome}:{row.Start}-{row.End}", axis=1).values.astype(str)
+
+    # Open zarr group for deletion
+    z = zarr.open(zarr_file, mode="a")
+
+    # If the group exists, delete it entirely (overwrite)
+    if f"deleted/{name}" in z:
+        del z[f"deleted/{name}"]
+
+    group = z.require_group(f"deleted/{name}")
+    group.create_dataset("deleted_peak_names", data=peak_names)
+
+    print(f"Written deletion '{name}' to {zarr_file}/deleted/{name}")
+
+

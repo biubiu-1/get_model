@@ -1368,7 +1368,6 @@ class RegionMotifDelta(RegionMotif):
             return
 
         initial_num_peaks = len(self.peak_names)
-        print("Added group subkeys:", list(self.dataset['added'].group_keys()))
 
         print(f"Initial number of peaks: {initial_num_peaks}")
 
