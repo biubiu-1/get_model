@@ -1329,8 +1329,9 @@ class InferenceRegionMotifDataset(RegionMotifDataset):
 
 # Zhenhuan Jiang, 14th July, 2025
 class RegionMotifDelta(RegionMotif):
-    def __init__(self, cfg: RegionMotifConfig):
+    def __init__(self, cfg: RegionMotifConfig, run_id: str):
         super().__init__(cfg)
+        self.run_id = run_id
         self._load_added_groups()
         self._load_deleted_groups()
 
@@ -1370,56 +1371,54 @@ class RegionMotifDelta(RegionMotif):
         print("Added group subkeys:", list(self.dataset['added'].group_keys()))
 
         print(f"Initial number of peaks: {initial_num_peaks}")
-        for group_name in self.dataset['added'].group_keys():
-            group = self.dataset['added'][group_name]
 
-            if 'data' not in group or 'peak_names' not in group:
-                print(f"Skipping added group {group_name}: missing 'data' or 'peak_names'.")
-                continue
+        group_name = self.run_id
 
-            added_data = group['data'][:]
-            added_peak_names = group['peak_names'][:]
+        if group_name not in self.dataset['added']:
+            print(f"Skipping added group {group_name}: not found.")
+            return
 
-            if added_data.shape[1] != self.data.shape[1]:
-                print(f"Skipping added group {group_name}: incompatible data shape {added_data.shape} vs {self.data.shape}.")
-                continue
+        group = self.dataset['added'][group_name]
 
-            self.data = np.vstack([self.data, added_data])
-            self.peak_names = np.concatenate([self.peak_names, added_peak_names])
+        added_data = group['data'][:]
+        added_peak_names = group['peak_names'][:]
 
-            # ATAC signals
-            if f"atpm/{self.celltype}" in group:
-                added_atpm = group[f"atpm/{self.celltype}"][:]
-                self.atpm = np.concatenate([self.atpm, added_atpm])
-            else:
-                self.atpm = np.concatenate([self.atpm, np.ones(added_data.shape[0])])
+        self.data = np.vstack([self.data, added_data])
+        self.peak_names = np.concatenate([self.peak_names, added_peak_names])
 
-            # Expression and TSS
-            if f"expression_positive/{self.celltype}" in group:
-                added_expression_positive = group[f"expression_positive/{self.celltype}"][:]
-                added_expression_negative = group[f"expression_negative/{self.celltype}"][:]
-                added_tss = group[f"tss/{self.celltype}"][:]
-                self.expression_positive = np.concatenate([self.expression_positive, added_expression_positive])
-                self.expression_negative = np.concatenate([self.expression_negative, added_expression_negative])
-                self.tss = np.concatenate([self.tss, added_tss])
-            else:
-                self.expression_positive = np.concatenate([self.expression_positive, np.zeros(added_data.shape[0])])
-                self.expression_negative = np.concatenate([self.expression_negative, np.zeros(added_data.shape[0])])
-                self.tss = np.concatenate([self.tss, np.zeros(added_data.shape[0])])
+        # ATAC signals
+        if f"atpm/{self.celltype}" in group:
+            added_atpm = group[f"atpm/{self.celltype}"][:]
+            self.atpm = np.concatenate([self.atpm, added_atpm])
+        else:
+            self.atpm = np.concatenate([self.atpm, np.ones(added_data.shape[0])])
 
-            # gene_idx_info
-            if 'gene_idx_info_index' in group:
-                added_gene_idx_index = np.array(group['gene_idx_info_index'][:])
-                added_gene_idx_name = group['gene_idx_info_name'][:]
-                added_gene_idx_strand = group['gene_idx_info_strand'][:]
-                added_gene_idx_info = pd.DataFrame({
-                    "index": added_gene_idx_index + initial_num_peaks,
-                    "gene_name": added_gene_idx_name,
-                    "strand": added_gene_idx_strand
-                })
-                self.gene_idx_info = pd.concat([self.gene_idx_info, added_gene_idx_info], ignore_index=True)
-            else:
-                print(f"No gene_idx_info for added group {group_name}. Skipping gene index update.")
+        # Expression and TSS
+        if f"expression_positive/{self.celltype}" in group:
+            added_expression_positive = group[f"expression_positive/{self.celltype}"][:]
+            added_expression_negative = group[f"expression_negative/{self.celltype}"][:]
+            added_tss = group[f"tss/{self.celltype}"][:]
+            self.expression_positive = np.concatenate([self.expression_positive, added_expression_positive])
+            self.expression_negative = np.concatenate([self.expression_negative, added_expression_negative])
+            self.tss = np.concatenate([self.tss, added_tss])
+        else:
+            self.expression_positive = np.concatenate([self.expression_positive, np.zeros(added_data.shape[0])])
+            self.expression_negative = np.concatenate([self.expression_negative, np.zeros(added_data.shape[0])])
+            self.tss = np.concatenate([self.tss, np.zeros(added_data.shape[0])])
+
+        # gene_idx_info
+        if 'gene_idx_info_index' in group:
+            added_gene_idx_index = np.array(group['gene_idx_info_index'][:])
+            added_gene_idx_name = group['gene_idx_info_name'][:]
+            added_gene_idx_strand = group['gene_idx_info_strand'][:]
+            added_gene_idx_info = pd.DataFrame({
+                "index": added_gene_idx_index + initial_num_peaks,
+                "gene_name": added_gene_idx_name,
+                "strand": added_gene_idx_strand
+            })
+            self.gene_idx_info = pd.concat([self.gene_idx_info, added_gene_idx_info], ignore_index=True)
+        else:
+            print(f"No gene_idx_info for added group {group_name}. Skipping gene index update.")
 
         self._sort_peaks_and_update()
 
@@ -1435,12 +1434,10 @@ class RegionMotifDelta(RegionMotif):
 
         deleted_peaks = set()
         # Collect all deleted peaks from the 'deleted' group
-        for group_name in self.dataset['deleted'].group_keys():
-            group = self.dataset['deleted'][group_name]
-            if 'deleted_peak_names' not in group:
-                logging.warning(f"Skipping deleted group {group_name}: missing 'deleted_peak_names'.")
-                continue
-            deleted_peaks.update(group['deleted_peak_names'][:])
+        
+        group_name = self.run_id
+        group = self.dataset['deleted'][group_name]
+        deleted_peaks.update(group['deleted_peak_names'][:])
 
         if not deleted_peaks:
             print("No peaks to delete from 'deleted' group.")
@@ -1478,8 +1475,9 @@ class RegionMotifDelta(RegionMotif):
 
 # Zhenhuan Jiang, 14th July, 2025
 class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)  
+    def __init__(self, run_id, **kwargs):
+        self.run_id = run_id
+        super().__init__(**kwargs)
 
     def _load_region_motifs(self) -> Dict[str, RegionMotifDelta]:
         """Override to use RegionMotifDelta for loading data with incremental and decremental peaks."""
@@ -1514,7 +1512,7 @@ class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
                 celltype=celltype,
                 drop_zero_atpm=self.drop_zero_atpm,
             )
-            region_motifs[celltype] = RegionMotifDelta(cfg)
+            region_motifs[celltype] = RegionMotifDelta(cfg, run_id=self.run_id)
             print(f"Loaded region motifs for celltype {celltype}: {region_motifs[celltype].num_peaks} peaks")
 
         return region_motifs

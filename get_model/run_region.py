@@ -437,6 +437,7 @@ class RegionZarrDeltaDataModule(RegionDataModule):
             is_train=is_train,
             gene_list=self.cfg.task.gene_list if gene_list is None else gene_list,
             gencode_obj=gencode_obj,
+            run_id=self.cfg.task.run_id,
         )
     
     def setup(self, stage=None):

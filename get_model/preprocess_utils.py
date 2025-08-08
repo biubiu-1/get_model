@@ -96,7 +96,36 @@ def query_motif(peak_bed, motif_bed, base_name = 'query_motif'):
     )
     return base_name+".bed"
 
-def get_motif(peak_file, motif_file, threads = 4, base_name='get_motif'):
+def get_motif(peak_file, motif_file, base_name='get_motif'):
+    # 8th Aug 2025: No chromosome splitting, no loop, single process.
+
+    cmd = f'''
+    ATAC_PEAK_FILE="{peak_file}"
+    ATAC_MOTIF_FILE="{motif_file}"
+    OUTPUT_BASE="{base_name}"
+
+    # Step 1: extract columns 1-3 from peak file and filter unwanted chromosomes
+    awk '{{OFS="\\t"; print $1,$2,$3}}' "$ATAC_PEAK_FILE" | \
+        grep -Ev "random|alt|KI|chrY" > "$OUTPUT_BASE.filtered_peak.bed"
+
+    # Step 2: keep all columns from motif file, filter unwanted chromosomes
+    grep -Ev "random|alt|KI|chrY" "$ATAC_MOTIF_FILE" > "$OUTPUT_BASE.filtered_motif.bed"
+
+    # Step 3: intersect, sort, and group
+    bedtools intersect -a "$OUTPUT_BASE.filtered_peak.bed" -b "$OUTPUT_BASE.filtered_motif.bed" -wa -wb |
+    cut -f1,2,3,7,8,10 |
+    sort -k1,1 -k2,2n -k3,3n -k4,4 |
+    bedtools groupby -i - -g 1-4 -c 5 -o sum \
+    > "$OUTPUT_BASE.bed"
+
+    # Step 4: clean up
+    rm "$OUTPUT_BASE.filtered_peak.bed" "$OUTPUT_BASE.filtered_motif.bed"
+    '''
+    
+    subprocess.run(cmd, shell=True, check=True, executable='/bin/bash')
+    return base_name + '.bed'
+
+def _get_motif(peak_file, motif_file, threads=4, base_name='get_motif'):
     # 4th, June, 2025; Revised by Zhenhuan Jiang.
     # Output equivalence has been verfied by md5sum. 
     # After that, `-k1,1V` was changed to `-k1,1` for general consistency.
