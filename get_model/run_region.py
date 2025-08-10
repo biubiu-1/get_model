@@ -84,7 +84,7 @@ class RegionDataModule(L.LightningDataModule):
             num_workers=self.cfg.machine.num_workers,
             drop_last=True,
             shuffle=True,
-            persistent_workers=True,
+            persistent_workers=True if self.cfg.machine.num_workers > 0 else False,
         )
 
     def val_dataloader(self):
@@ -93,7 +93,7 @@ class RegionDataModule(L.LightningDataModule):
             batch_size=self.cfg.machine.batch_size,
             num_workers=self.cfg.machine.num_workers,
             drop_last=True,
-            persistent_workers=True,
+            persistent_workers=True if self.cfg.machine.num_workers > 0 else False,
         )
 
     def test_dataloader(self):
@@ -102,7 +102,7 @@ class RegionDataModule(L.LightningDataModule):
             batch_size=self.cfg.machine.batch_size,
             num_workers=self.cfg.machine.num_workers,
             drop_last=True,
-            persistent_workers=True,
+            persistent_workers=True if self.cfg.machine.num_workers > 0 else False,
         )
 
     def predict_dataloader(self):
@@ -111,7 +111,7 @@ class RegionDataModule(L.LightningDataModule):
             batch_size=self.cfg.machine.batch_size,
             num_workers=self.cfg.machine.num_workers,
             drop_last=False,
-            persistent_workers=True,
+            persistent_workers=True if self.cfg.machine.num_workers > 0 else False,
         )
 
 

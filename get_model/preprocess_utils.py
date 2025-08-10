@@ -108,18 +108,15 @@ def get_motif(peak_file, motif_file, base_name='get_motif'):
     awk '{{OFS="\\t"; print $1,$2,$3}}' "$ATAC_PEAK_FILE" | \
         grep -Ev "random|alt|KI|chrY" > "$OUTPUT_BASE.filtered_peak.bed"
 
-    # Step 2: keep all columns from motif file, filter unwanted chromosomes
-    grep -Ev "random|alt|KI|chrY" "$ATAC_MOTIF_FILE" > "$OUTPUT_BASE.filtered_motif.bed"
-
-    # Step 3: intersect, sort, and group
-    bedtools intersect -a "$OUTPUT_BASE.filtered_peak.bed" -b "$OUTPUT_BASE.filtered_motif.bed" -wa -wb |
+    # Step 2: intersect, sort, and group
+    bedtools intersect -a "$OUTPUT_BASE.filtered_peak.bed" -b "$ATAC_MOTIF_FILE" -wa -wb |
     cut -f1,2,3,7,8,10 |
     sort -k1,1 -k2,2n -k3,3n -k4,4 |
     bedtools groupby -i - -g 1-4 -c 5 -o sum \
     > "$OUTPUT_BASE.bed"
 
-    # Step 4: clean up
-    rm "$OUTPUT_BASE.filtered_peak.bed" "$OUTPUT_BASE.filtered_motif.bed"
+    # Step 3: clean up
+    rm "$OUTPUT_BASE.filtered_peak.bed"
     '''
     
     subprocess.run(cmd, shell=True, check=True, executable='/bin/bash')
@@ -599,19 +596,23 @@ def add_activated_tss_to_zarr(
     z = zarr.open(zarr_file, mode="a")
     group = z[f"added/{name}"]
 
-    for ds in [f"expression_positive/{celltype}", f"expression_negative/{celltype}", f"tss/{celltype}"]:
-        if ds in group:
-            del group[ds]
+    datasets = {
+        f"expression_positive/{celltype}": (exp_data[:, 0], np.float32),
+        f"expression_negative/{celltype}": (exp_data[:, 1], np.float32),
+        f"tss/{celltype}": (tss, np.int8),
+    }
 
-        group.create_dataset(f"expression_positive/{celltype}", data=exp_data[:, 0], dtype=np.float32)
-        group.create_dataset(f"expression_negative/{celltype}", data=exp_data[:, 1], dtype=np.float32)
-        group.create_dataset(f"tss/{celltype}", data=tss, dtype=np.int8)
+    for ds_name, (data, dtype) in datasets.items():
+        if ds_name in group:
+            del group[ds_name]
+        group.create_dataset(ds_name, data=data, dtype=dtype)
 
-        group["gene_idx_info_index"] = gene_idx_info[:, 0].astype(int)
-        group["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
-        group["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
+    group["gene_idx_info_index"] = gene_idx_info[:, 0].astype(int)
+    group["gene_idx_info_name"] = gene_idx_info[:, 1].astype(str)
+    group["gene_idx_info_strand"] = gene_idx_info[:, 2].astype(str)
 
-        print(f"TSS and dummy expression annotated for 'added/{name}' with celltype '{celltype}'.")
+    print(f"TSS and dummy expression annotated for 'added/{name}' with celltype '{celltype}'.")
+
 
 
 def add_activation_to_zarr(
