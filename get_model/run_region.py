@@ -2,6 +2,7 @@ import gc
 import logging
 from functools import partial
 
+import os
 import lightning as L
 import numpy as np
 import pandas as pd
@@ -22,7 +23,7 @@ from get_model.dataset.zarr_dataset import (
     RegionDataset,
     RegionMotifDataset,
     get_gencode_obj,
-    InferenceRegionMotifDeltaDataset,
+    RegionDeltaInferenceDataset,
 )
 from get_model.model.model import *
 from get_model.model.modules import *
@@ -421,29 +422,176 @@ class RegionZarrDataModule(RegionDataModule):
             gencode_obj=gencode_obj,
         )
 
-# Zhenhuan Jiang, 14th July, 2025
-class RegionZarrDeltaDataModule(RegionDataModule):
-    def __init__(self, cfg: DictConfig):
+# A delta class with predict_step suitable for RegionDeltaInferenceDataset making batched gene expression prediction
+# 8th Aug, Zhenhuan Jiang
+class RegionDeltaLitModel(RegionLitModel):
+    def __init__(self, cfg):
+            super().__init__(cfg)
+                
+    def __predict_step(self, batch, batch_idx, *args, **kwargs):
+        loss, preds, obs = self._shared_step(batch, batch_idx, stage="predict")
+        result_list = []
+
+        batch_size = len(batch["gene_names"])
+        for i in range(batch_size):
+            region_data = torch.tensor(batch["region_motif"][i], dtype=torch.float32)
+            gene_names = batch["gene_names"][i]   # list of str
+            all_tss_peak = batch["all_tss_peak"][i]
+            strands = batch["strands"][i]
+            peak_coord = batch["peak_coord"][i]
+
+            for j, gene_name in enumerate(gene_names):
+                tss_idx = all_tss_peak[j]
+                if gene_name == "-1" or tss_idx < 0 or tss_idx >= region_data.shape[0]:
+                    continue
+
+                strand = strands[j]
+
+                for key in preds:
+                    pred_val = preds[key][i][:, strand][tss_idx].max().cpu().item()
+                    obs_val = obs[key][i][:, strand][tss_idx].max().cpu().item()
+                    atpm_val = region_data[tss_idx, -1].item()
+
+                    result_list.append({
+                        "gene_name": gene_name,
+                        "key": key,
+                        "pred": pred_val,
+                        "obs": obs_val,
+                        "atpm": atpm_val,
+                        "peak_coord": peak_coord[tss_idx]
+                    })
+
+        result_df = pd.DataFrame(result_list)
+        output_dir = f"{self.cfg.machine.output_dir}/{self.cfg.run.project_name}"
+        os.makedirs(output_dir, exist_ok=True)
+        result_df.to_csv(
+            f"{output_dir}/{self.cfg.run.run_name}.csv",
+            index=False,
+            mode="a",
+            header=False
+        )
+        return result_df
+    
+    def predict_step(self, batch, batch_idx, *args, **kwargs):
+        # 共享 step，得到预测和观测结果
+        loss, preds, obs = self._shared_step(batch, batch_idx, stage="predict")
+
+        result_list = []
+
+        # region_motif 已经是 tensor [B, N, F]
+        batch_region_motif = batch["region_motif"]
+        batch_strands = batch["strands"]
+        batch_exp_label = batch["exp_label"]
+        batch_mask = batch["mask"]
+
+        batch_gene_names = batch["gene_names"]
+        batch_all_tss_peak = batch["all_tss_peak"]
+        batch_peak_coord = batch["peak_coord"]
+        batch_celltype = batch["celltype"]
+
+        batch_size = batch_region_motif.size(0)
+
+        for i in range(batch_size):
+            region_data = batch_region_motif[i]  # [num_regions, num_features]
+            strands = batch_strands[i]           # [num_regions]
+            exp_label = batch_exp_label[i]       # [num_regions, 2]
+            mask = batch_mask[i]                 # [num_regions]
+
+            gene_names = batch_gene_names[i]     # list of str
+            all_tss_peak = batch_all_tss_peak[i]
+            peak_coord = batch_peak_coord[i]
+            celltype = batch_celltype[i]
+
+            for j, gene_name in enumerate(gene_names):
+                tss_idx = all_tss_peak[j]
+                if gene_name == "-1" or tss_idx < 0 or tss_idx >= region_data.shape[0]:
+                    continue
+
+                strand = strands[j]
+
+                for key in preds:
+                    # preds[key] shape: [B, C, 2, num_regions] 或类似
+                    pred_val = preds[key][i][:, strand][tss_idx].max().cpu().item()
+                    obs_val = obs[key][i][:, strand][tss_idx].max().cpu().item()
+                    atpm_val = region_data[tss_idx, -1].item()
+
+                    result_list.append({
+                        "gene_name": gene_name,
+                        "key": key,
+                        "pred": pred_val,
+                        "obs": obs_val,
+                        "atpm": atpm_val,
+                        "peak_coord": peak_coord[tss_idx],
+                        "celltype": celltype
+                    })
+
+        result_df = pd.DataFrame(result_list)
+        output_dir = f"{self.cfg.machine.output_dir}/{self.cfg.run.project_name}"
+        os.makedirs(output_dir, exist_ok=True)
+        result_df.to_csv(
+            f"{output_dir}/{self.cfg.run.run_name}.csv",
+            index=False,
+            mode="a",
+            header=False
+        )
+
+        return result_df
+
+
+
+class RegionZarrDeltaDataModule(RegionZarrDataModule):
+    def __init__(self, cfg):
         super().__init__(cfg)
+        
+    @staticmethod
+    def region_collate_fn(batch):
+        collated = {
+            "region_motif": [],
+            "gene_names": [],
+            "all_tss_peak": [],
+            "strands": [],
+            "peak_coord": [],
+            "exp_label": [],
+            "celltype": [],
+            "mask": []
+        }
 
-    def build_inference_dataset(self, is_train=False, gene_list=None, gencode_obj=None):
-        if gencode_obj is None:
-            gencode_obj = get_gencode_obj(self.cfg.assembly)
-        logging.debug(gencode_obj)
+        for sample in batch:
+            collated["region_motif"].append(torch.tensor(sample["region_motif"], dtype=torch.float32))
+            collated["gene_names"].append(sample["gene_names"])  # list of str
+            collated["all_tss_peak"].append(sample["all_tss_peak"])
+            collated["strands"].append(torch.tensor(sample["strands"], dtype=torch.int64))
+            collated["peak_coord"].append(sample["peak_coord"])
+            collated["exp_label"].append(torch.tensor(sample["exp_label"], dtype=torch.float32))
+            collated["celltype"].append(sample["celltype"])
+            collated["mask"].append(torch.tensor(sample["mask"], dtype=torch.float32))
 
-        return InferenceRegionMotifDeltaDataset(
+        # stack tensors for batch
+        collated["region_motif"] = torch.stack(collated["region_motif"], dim=0)
+        collated["strands"] = torch.stack(collated["strands"], dim=0)
+        collated["exp_label"] = torch.stack(collated["exp_label"], dim=0)
+        collated["mask"] = torch.stack(collated["mask"], dim=0)
+
+        return collated
+
+
+    def predict_dataloader(self):
+        return torch.utils.data.DataLoader(
+        self.dataset_predict,
+        batch_size=self.cfg.machine.batch_size,
+        num_workers=self.cfg.machine.num_workers,
+        drop_last=False,
+        persistent_workers=True if self.cfg.machine.num_workers > 0 else False,
+        collate_fn=RegionZarrDeltaDataModule.region_collate_fn, 
+    )
+
+    def build_inference_dataset(self, gene_list=None):
+        return RegionDeltaInferenceDataset(
             **self.cfg.dataset,
-            assembly=self.cfg.assembly,
-            is_train=is_train,
             gene_list=self.cfg.task.gene_list if gene_list is None else gene_list,
-            gencode_obj=gencode_obj,
             run_id=self.cfg.task.run_id,
         )
-    
-    def setup(self, stage=None):
-        if stage == "predict":
-            self.mutations = None
-            self.dataset_predict = self.build_inference_dataset()
+
 
 # deprecated
 def run(cfg: DictConfig):
@@ -466,7 +614,7 @@ def run_zarr(cfg: DictConfig):
 
 # Zhenhuan Jiang, 14th July, 2025
 def run_zarr_delta(cfg: DictConfig):
-    model = RegionLitModel(cfg)
+    model = RegionDeltaLitModel(cfg)
     logging.debug(OmegaConf.to_yaml(cfg))
     dm = RegionZarrDeltaDataModule(cfg)
     model.dm = dm

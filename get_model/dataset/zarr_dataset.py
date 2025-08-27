@@ -1327,11 +1327,12 @@ class InferenceRegionMotifDataset(RegionMotifDataset):
         }
 
 
-# Zhenhuan Jiang, 14th July, 2025
+# Zhenhuan Jiang, 22nd Aug, 2025
 class RegionMotifDelta(RegionMotif):
     def __init__(self, cfg: RegionMotifConfig, run_id: str):
         super().__init__(cfg)
         self.run_id = run_id
+        self.delta_mask = np.zeros(len(self.peak_names), dtype=bool)
         self._load_added_groups()
         self._load_deleted_groups()
 
@@ -1352,6 +1353,9 @@ class RegionMotifDelta(RegionMotif):
         self.expression_positive = self.expression_positive[sorted_idx]
         self.expression_negative = self.expression_negative[sorted_idx]
         self.tss = self.tss[sorted_idx]
+
+        if hasattr(self, "delta_mask"):
+            self.delta_mask = self.delta_mask[sorted_idx]
 
         if hasattr(self, "gene_idx_info") and not self.gene_idx_info.empty:
             old_to_new = dict(zip(sorted_idx, np.arange(len(sorted_idx))))
@@ -1419,99 +1423,193 @@ class RegionMotifDelta(RegionMotif):
         else:
             print(f"No gene_idx_info for added group {group_name}. Skipping gene index update.")
 
+        # Mark delta_mask for added peaks
+        self.delta_mask = np.concatenate([self.delta_mask, np.ones(added_data.shape[0], dtype=np.int8)])
+
         self._sort_peaks_and_update()
 
         print(f"Total peaks after adding: {len(self.peak_names)}")
 
-
-
     def _load_deleted_groups(self):
-        """Filter out peaks from the 'deleted' group in the Zarr file."""
+        """Mark deleted peaks in delta_mask without removing them."""
         if 'deleted' not in self.dataset:
-            print("No 'deleted' group found in Zarr file. No peaks removed.")
+            print("No 'deleted' group found in Zarr file. No peaks marked.")
             return
 
-        deleted_peaks = set()
-        # Collect all deleted peaks from the 'deleted' group
-        
         group_name = self.run_id
-        group = self.dataset['deleted'][group_name]
-        deleted_peaks.update(group['deleted_peak_names'][:])
-
-        if not deleted_peaks:
-            print("No peaks to delete from 'deleted' group.")
+        if group_name not in self.dataset['deleted']:
+            print(f"Deleted group {group_name} not found. Skipping.")
             return
 
-        # Filter out deleted peaks
-        keep_mask = ~np.isin(self.peak_names, list(deleted_peaks))
-        self.data = self.data[keep_mask]
-        self.peak_names = self.peak_names[keep_mask]
-        self.atpm = self.atpm[keep_mask]
-        self.expression_positive = self.expression_positive[keep_mask]
-        self.expression_negative = self.expression_negative[keep_mask]
-        self.tss = self.tss[keep_mask]
+        group = self.dataset['deleted'][group_name]
+        deleted_peaks = group['deleted_peak_names'][:]
+        if len(deleted_peaks) == 0:
+            return
 
-        # Update gene_idx_info
-        keep_indices = np.where(keep_mask)[0]
-        idx_to_iloc = {v: i for i, v in enumerate(self.gene_idx_info['index'])}
-        updated_gene_idx_info = []
-        for idx in keep_indices:
-            if idx in idx_to_iloc:
-                updated_gene_idx_info.append((
-                    idx,
-                    self.gene_idx_info.iloc[idx_to_iloc[idx]]['gene_name'],
-                    self.gene_idx_info.iloc[idx_to_iloc[idx]]['strand']
-                ))
-        self.gene_idx_info = pd.DataFrame(
-            updated_gene_idx_info,
-            columns=["index", "gene_name", "strand"]
-        )
+        # Mark deleted peaks in delta_mask
+        mask = np.isin(self.peak_names, deleted_peaks)
+        self.delta_mask[mask] = -1  # deleted = -1
 
-        # Update peaks
-        self._process_peaks()
-        print(f"Removed {np.sum(~keep_mask)} peaks from 'deleted' group.")
+# Zhenhuan Jiang, 22nd Aug, 2025
+class RegionDeltaInferenceDataset(Dataset):
+    def __init__(
+            self,
+            zarr_path,
+            run_id,
+            celltypes,
+            num_region_per_sample=200,
+            sampling_step=50,
+            leave_out_celltypes=None,
+            leave_out_chromosomes=None,
+            mask_ratio=0.0,
+            quantitative_atac=False,
+            drop_zero_atpm=False,
+            transform=None,
+            gene_list=None
+        ):
 
-
-# Zhenhuan Jiang, 14th July, 2025
-class InferenceRegionMotifDeltaDataset(InferenceRegionMotifDataset):
-    def __init__(self, run_id, **kwargs):
+        self.zarr_path = zarr_path.split(",") if isinstance(zarr_path, str) else zarr_path
         self.run_id = run_id
-        super().__init__(**kwargs)
+        self.celltypes = celltypes.split(",") if isinstance(celltypes, str) else celltypes
+        self.num_region_per_sample = num_region_per_sample
+        self.sampling_step = sampling_step
+        self.leave_out_celltypes = leave_out_celltypes.split(",") if isinstance(leave_out_celltypes, str) else leave_out_celltypes or []
+        self.leave_out_chromosomes = leave_out_chromosomes.split(",") if isinstance(leave_out_chromosomes, str) else leave_out_chromosomes or []
+        self.mask_ratio = mask_ratio
+        self.quantitative_atac = quantitative_atac
+        self.drop_zero_atpm = drop_zero_atpm
+        self.transform = transform
+        self.gene_list = gene_list
 
-    def _load_region_motifs(self) -> Dict[str, RegionMotifDelta]:
-        """Override to use RegionMotifDelta for loading data with incremental and decremental peaks."""
+        self.region_motifs = self._load_region_motifs()
+        self.sample_indices = []
+        self.setup()
+    
+    def _load_region_motifs(self):
         region_motifs = {}
         for celltype in self.celltypes:
-            if (
-                self.is_train
-                and len(self.leave_out_celltypes) > 0
-                and celltype in self.leave_out_celltypes
-            ):
-                continue
-            if (
-                not self.is_train
-                and len(self.leave_out_celltypes) > 0
-                and celltype not in self.leave_out_celltypes
-            ):
-                continue
-            
-            zarr_path = None
+            zarr_file = None
             for path in self.zarr_path:
                 if celltype in zarr.open(path, mode='r')['atpm'].keys():
-                    zarr_path = path
+                    zarr_file = path
                     break
-                    
-            if zarr_path is None:
-                print(f"Could not find zarr file containing celltype {celltype}")
+            if zarr_file is None:
+                logging.warning(f"No zarr file for celltype {celltype}")
                 continue
-                    
             cfg = RegionMotifConfig(
-                root=os.path.dirname(zarr_path),
-                data=os.path.basename(zarr_path),
+                root=os.path.dirname(zarr_file),
+                data=os.path.basename(zarr_file),
                 celltype=celltype,
-                drop_zero_atpm=self.drop_zero_atpm,
+                drop_zero_atpm=False
             )
             region_motifs[celltype] = RegionMotifDelta(cfg, run_id=self.run_id)
-            print(f"Loaded region motifs for celltype {celltype}: {region_motifs[celltype].num_peaks} peaks")
-
         return region_motifs
+
+    def setup(self):
+        for celltype, region_motif in tqdm(self.region_motifs.items(), desc="Setup regions"):
+            delta_mask = region_motif.delta_mask
+            if delta_mask is None or np.all(delta_mask == -1):
+                logging.info(f"No differential peaks for celltype {celltype}, skipping.")
+                continue
+
+            keep_mask = delta_mask != -1
+            valid_indices = np.where(keep_mask)[0]
+            if len(valid_indices) < 1:
+                continue
+
+            peaks_df = region_motif.peaks.iloc[valid_indices].copy()
+            peaks_df["valid_idx"] = valid_indices
+            grouped = peaks_df.groupby("Chromosome")
+
+            for chrom, chrom_peaks in grouped:
+                chrom_indices = chrom_peaks["valid_idx"].values
+                num_chrom_peaks = len(chrom_indices)
+
+                for start_idx in range(0, num_chrom_peaks, max(1, self.num_region_per_sample)):
+                    end_idx = min(start_idx + self.num_region_per_sample, num_chrom_peaks)
+                    if end_idx - start_idx < 1:
+                        continue
+
+                    orig_indices = chrom_indices[start_idx:end_idx]
+
+                    raw_slice = region_motif.delta_mask[orig_indices[0]:orig_indices[-1]+1]
+                    if np.all(raw_slice == 0):
+                        continue
+
+                    peak_coord = region_motif.peaks.iloc[orig_indices][["Start", "End"]].values
+                    gene_info = region_motif.gene_idx_info[
+                        (region_motif.gene_idx_info["index"] >= orig_indices[0]) &
+                        (region_motif.gene_idx_info["index"] <= orig_indices[-1])
+                    ]
+
+                    if self.gene_list is not None:
+                        gene_info = gene_info[gene_info["gene_name"].isin(self.gene_list)]
+                        if gene_info.empty:
+                            continue
+
+                    tss_indices = gene_info["index"].values if not gene_info.empty else np.array([], dtype=np.int64)
+                    strands_map = {"+":0, "-":1}
+                    strands = np.array([strands_map[s] for s in gene_info["strand"].values], dtype=np.int64) if not gene_info.empty else np.array([], dtype=np.int64)
+                    gene_names = gene_info["gene_name"].values if not gene_info.empty else np.array([], dtype=object)
+
+                    if len(tss_indices) > 0:
+                        rel_tss = np.searchsorted(orig_indices, tss_indices)
+                        rel_tss = rel_tss[(rel_tss >= 0) & (rel_tss < self.num_region_per_sample)]
+                    else:
+                        rel_tss = np.array([], dtype=np.int64)
+
+                    pad_len = self.num_region_per_sample - len(rel_tss)
+                    padded_tss = np.pad(rel_tss[:self.num_region_per_sample], (0, pad_len), constant_values=-1)
+                    padded_gene_names = np.full(self.num_region_per_sample, "-1", dtype=object)
+                    padded_strands = np.zeros(self.num_region_per_sample, dtype=np.int64)
+                    for j, idx in enumerate(rel_tss[:self.num_region_per_sample]):
+                        if j < len(gene_names):
+                            padded_gene_names[j] = gene_names[j]
+                            padded_strands[j] = strands[j]
+
+                    self.sample_indices.append({
+                        "celltype": celltype,
+                        "slice_idx": orig_indices,
+                        "all_tss_peak": padded_tss,
+                        "gene_names": padded_gene_names,
+                        "strands": padded_strands,
+                        "peak_coord": peak_coord
+                    })
+
+    def __len__(self):
+        return len(self.sample_indices)
+
+    def __getitem__(self, idx):
+        sample = self.sample_indices[idx]
+        celltype = sample["celltype"]
+        slice_idx = sample["slice_idx"]
+        region_motif = self.region_motifs[celltype]
+
+        region_data = region_motif.normalized_data[slice_idx]
+        expression_positive = region_motif.expression_positive[slice_idx]
+        expression_negative = region_motif.expression_negative[slice_idx]
+        tss = region_motif.tss[slice_idx]
+        atpm = region_motif.atpm[slice_idx]
+
+        if self.quantitative_atac:
+            region_data = np.concatenate([region_data, atpm.reshape(-1,1)/(atpm.max()+1e-6)], axis=1)
+        else:
+            region_data = np.concatenate([region_data, np.ones((len(slice_idx),1), dtype=np.float32)], axis=1)
+
+        target = coo_matrix(np.column_stack([expression_positive, expression_negative]))
+
+        mask = np.zeros(len(tss), dtype=np.float32) if self.mask_ratio == 0 else np.random.choice([0,1], size=len(tss), p=[1-self.mask_ratio, self.mask_ratio])
+
+        if self.transform:
+            region_data, mask, target = self.transform(region_data, mask, target)
+
+        return {
+            "region_motif": region_data.astype(np.float32),
+            "mask": mask.astype(np.float32),
+            "all_tss_peak": sample["all_tss_peak"],
+            "gene_names": sample["gene_names"].tolist(),
+            "strands": sample["strands"],
+            "exp_label": target.toarray().astype(np.float32),
+            "celltype": celltype,
+            "peak_coord": sample["peak_coord"]
+        }
