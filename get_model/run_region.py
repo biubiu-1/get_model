@@ -428,57 +428,12 @@ class RegionDeltaLitModel(RegionLitModel):
     def __init__(self, cfg):
             super().__init__(cfg)
                 
-    def __predict_step(self, batch, batch_idx, *args, **kwargs):
-        loss, preds, obs = self._shared_step(batch, batch_idx, stage="predict")
-        result_list = []
 
-        batch_size = len(batch["gene_names"])
-        for i in range(batch_size):
-            region_data = torch.tensor(batch["region_motif"][i], dtype=torch.float32)
-            gene_names = batch["gene_names"][i]   # list of str
-            all_tss_peak = batch["all_tss_peak"][i]
-            strands = batch["strands"][i]
-            peak_coord = batch["peak_coord"][i]
-
-            for j, gene_name in enumerate(gene_names):
-                tss_idx = all_tss_peak[j]
-                if gene_name == "-1" or tss_idx < 0 or tss_idx >= region_data.shape[0]:
-                    continue
-
-                strand = strands[j]
-
-                for key in preds:
-                    pred_val = preds[key][i][:, strand][tss_idx].max().cpu().item()
-                    obs_val = obs[key][i][:, strand][tss_idx].max().cpu().item()
-                    atpm_val = region_data[tss_idx, -1].item()
-
-                    result_list.append({
-                        "gene_name": gene_name,
-                        "key": key,
-                        "pred": pred_val,
-                        "obs": obs_val,
-                        "atpm": atpm_val,
-                        "peak_coord": peak_coord[tss_idx]
-                    })
-
-        result_df = pd.DataFrame(result_list)
-        output_dir = f"{self.cfg.machine.output_dir}/{self.cfg.run.project_name}"
-        os.makedirs(output_dir, exist_ok=True)
-        result_df.to_csv(
-            f"{output_dir}/{self.cfg.run.run_name}.csv",
-            index=False,
-            mode="a",
-            header=False
-        )
-        return result_df
-    
     def predict_step(self, batch, batch_idx, *args, **kwargs):
-        # 共享 step，得到预测和观测结果
         loss, preds, obs = self._shared_step(batch, batch_idx, stage="predict")
 
         result_list = []
 
-        # region_motif 已经是 tensor [B, N, F]
         batch_region_motif = batch["region_motif"]
         batch_strands = batch["strands"]
         batch_exp_label = batch["exp_label"]
@@ -510,7 +465,6 @@ class RegionDeltaLitModel(RegionLitModel):
                 strand = strands[j]
 
                 for key in preds:
-                    # preds[key] shape: [B, C, 2, num_regions] 或类似
                     pred_val = preds[key][i][:, strand][tss_idx].max().cpu().item()
                     obs_val = obs[key][i][:, strand][tss_idx].max().cpu().item()
                     atpm_val = region_data[tss_idx, -1].item()

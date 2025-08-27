@@ -1458,6 +1458,7 @@ class RegionDeltaInferenceDataset(Dataset):
             run_id,
             celltypes,
             num_region_per_sample=200,
+            flank=200,
             sampling_step=50,
             leave_out_celltypes=None,
             leave_out_chromosomes=None,
@@ -1472,6 +1473,7 @@ class RegionDeltaInferenceDataset(Dataset):
         self.run_id = run_id
         self.celltypes = celltypes.split(",") if isinstance(celltypes, str) else celltypes
         self.num_region_per_sample = num_region_per_sample
+        self.flank = flank
         self.sampling_step = sampling_step
         self.leave_out_celltypes = leave_out_celltypes.split(",") if isinstance(leave_out_celltypes, str) else leave_out_celltypes or []
         self.leave_out_chromosomes = leave_out_chromosomes.split(",") if isinstance(leave_out_chromosomes, str) else leave_out_chromosomes or []
@@ -1525,18 +1527,21 @@ class RegionDeltaInferenceDataset(Dataset):
                 chrom_indices = chrom_peaks["valid_idx"].values
                 num_chrom_peaks = len(chrom_indices)
 
-                for start_idx in range(0, num_chrom_peaks, max(1, self.num_region_per_sample)):
+                for start_idx in range(0, num_chrom_peaks, self.num_region_per_sample):
                     end_idx = min(start_idx + self.num_region_per_sample, num_chrom_peaks)
                     if end_idx - start_idx < 1:
                         continue
 
-                    orig_indices = chrom_indices[start_idx:end_idx]
+                    flank_start = max(0, start_idx - self.flank)
+                    flank_end = min(num_chrom_peaks, end_idx + self.flank)
+                    orig_indices = chrom_indices[flank_start:flank_end]
 
                     raw_slice = region_motif.delta_mask[orig_indices[0]:orig_indices[-1]+1]
                     if np.all(raw_slice == 0):
                         continue
 
                     peak_coord = region_motif.peaks.iloc[orig_indices][["Start", "End"]].values
+
                     gene_info = region_motif.gene_idx_info[
                         (region_motif.gene_idx_info["index"] >= orig_indices[0]) &
                         (region_motif.gene_idx_info["index"] <= orig_indices[-1])
@@ -1547,29 +1552,33 @@ class RegionDeltaInferenceDataset(Dataset):
                         if gene_info.empty:
                             continue
 
-                    tss_indices = gene_info["index"].values if not gene_info.empty else np.array([], dtype=np.int64)
-                    strands_map = {"+":0, "-":1}
-                    strands = np.array([strands_map[s] for s in gene_info["strand"].values], dtype=np.int64) if not gene_info.empty else np.array([], dtype=np.int64)
-                    gene_names = gene_info["gene_name"].values if not gene_info.empty else np.array([], dtype=object)
+                    center_indices = chrom_indices[start_idx:end_idx]
+                    tss_info = gene_info[
+                        (gene_info["index"] >= center_indices[0]) &
+                        (gene_info["index"] <= center_indices[-1])
+                    ]
 
-                    if len(tss_indices) > 0:
+                    if not tss_info.empty:
+                        tss_indices = tss_info["index"].values
                         rel_tss = np.searchsorted(orig_indices, tss_indices)
-                        rel_tss = rel_tss[(rel_tss >= 0) & (rel_tss < self.num_region_per_sample)]
                     else:
                         rel_tss = np.array([], dtype=np.int64)
 
                     pad_len = self.num_region_per_sample - len(rel_tss)
                     padded_tss = np.pad(rel_tss[:self.num_region_per_sample], (0, pad_len), constant_values=-1)
+
                     padded_gene_names = np.full(self.num_region_per_sample, "-1", dtype=object)
                     padded_strands = np.zeros(self.num_region_per_sample, dtype=np.int64)
-                    for j, idx in enumerate(rel_tss[:self.num_region_per_sample]):
-                        if j < len(gene_names):
-                            padded_gene_names[j] = gene_names[j]
-                            padded_strands[j] = strands[j]
+                    strands_map = {"+": 0, "-": 1}
+                    for j, (_, row) in enumerate(tss_info.iterrows()):
+                        if j < self.num_region_per_sample:
+                            padded_gene_names[j] = row["gene_name"]
+                            padded_strands[j] = strands_map.get(row["strand"], 0)
 
                     self.sample_indices.append({
                         "celltype": celltype,
                         "slice_idx": orig_indices,
+                        "roi_range": (start_idx - flank_start, end_idx - flank_start),  
                         "all_tss_peak": padded_tss,
                         "gene_names": padded_gene_names,
                         "strands": padded_strands,
@@ -1578,11 +1587,12 @@ class RegionDeltaInferenceDataset(Dataset):
 
     def __len__(self):
         return len(self.sample_indices)
-
+        
     def __getitem__(self, idx):
         sample = self.sample_indices[idx]
         celltype = sample["celltype"]
         slice_idx = sample["slice_idx"]
+        roi_start, roi_end = sample["roi_range"]
         region_motif = self.region_motifs[celltype]
 
         region_data = region_motif.normalized_data[slice_idx]
@@ -1592,13 +1602,26 @@ class RegionDeltaInferenceDataset(Dataset):
         atpm = region_motif.atpm[slice_idx]
 
         if self.quantitative_atac:
-            region_data = np.concatenate([region_data, atpm.reshape(-1,1)/(atpm.max()+1e-6)], axis=1)
+            region_data = np.concatenate(
+                [region_data, atpm.reshape(-1,1)/(atpm.max()+1e-6)], axis=1
+            )
         else:
-            region_data = np.concatenate([region_data, np.ones((len(slice_idx),1), dtype=np.float32)], axis=1)
+            region_data = np.concatenate(
+                [region_data, np.ones((len(slice_idx),1), dtype=np.float32)], axis=1
+            )
 
-        target = coo_matrix(np.column_stack([expression_positive, expression_negative]))
+        target = np.zeros((len(slice_idx), 2), dtype=np.float32)
+        target[roi_start:roi_end, 0] = expression_positive[roi_start:roi_end]
+        target[roi_start:roi_end, 1] = expression_negative[roi_start:roi_end]
 
-        mask = np.zeros(len(tss), dtype=np.float32) if self.mask_ratio == 0 else np.random.choice([0,1], size=len(tss), p=[1-self.mask_ratio, self.mask_ratio])
+        mask = np.zeros(len(slice_idx), dtype=np.float32)
+        if self.mask_ratio == 0:
+            mask[roi_start:roi_end] = 1.0
+        else:
+            roi_mask = np.random.choice(
+                [0,1], size=roi_end-roi_start, p=[1-self.mask_ratio, self.mask_ratio]
+            )
+            mask[roi_start:roi_end] = roi_mask
 
         if self.transform:
             region_data, mask, target = self.transform(region_data, mask, target)
@@ -1609,7 +1632,7 @@ class RegionDeltaInferenceDataset(Dataset):
             "all_tss_peak": sample["all_tss_peak"],
             "gene_names": sample["gene_names"].tolist(),
             "strands": sample["strands"],
-            "exp_label": target.toarray().astype(np.float32),
+            "exp_label": target.astype(np.float32),
             "celltype": celltype,
             "peak_coord": sample["peak_coord"]
         }
